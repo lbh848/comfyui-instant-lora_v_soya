@@ -503,8 +503,8 @@ class InstantReferenceLoRA(io.ComfyNode):
             for profile in profiles
         ]
         return io.Schema(
-            node_id="InstantReferenceLoRA",
-            display_name="Instant Reference LoRA",
+            node_id="md_soya_InstantReferenceLoRA",
+            display_name="md_soya Instant Reference LoRA",
             category=cls.CATEGORY,
             inputs=[
                 io.Model.Input("model"),
@@ -760,13 +760,13 @@ class TrainOptionsV1:
 
 
 NODE_CLASS_MAPPINGS = {
-    "InstantReferenceLoRA": InstantReferenceLoRAV1,
-    "ReferenceTaggingOptions": TaggingOptionsV1,
-    "ReferenceTrainOptions": TrainOptionsV1,
+    "md_soya_InstantReferenceLoRA": InstantReferenceLoRAV1,
+    "md_soya_ReferenceTaggingOptions": TaggingOptionsV1,
+    "md_soya_ReferenceTrainOptions": TrainOptionsV1,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "InstantReferenceLoRA": "Instant Reference LoRA",
-    "ReferenceTaggingOptions": "Reference Tagging Options",
-    "ReferenceTrainOptions": "Reference Train Options",
+    "md_soya_InstantReferenceLoRA": "md_soya Instant Reference LoRA",
+    "md_soya_ReferenceTaggingOptions": "md_soya Reference Tagging Options",
+    "md_soya_ReferenceTrainOptions": "md_soya Reference Train Options",
 }
