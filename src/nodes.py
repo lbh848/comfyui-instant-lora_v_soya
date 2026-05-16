@@ -96,6 +96,10 @@ def _split_tags(raw: str) -> list[str]:
     return [item.strip() for item in raw.split(",") if item.strip()]
 
 
+def _parse_prompt_groups(text: str) -> list[str]:
+    return [m.group(1).strip() for m in re.finditer(r"\[([^\]]*)\]", text)]
+
+
 def _tagging_options_from_input(value: Any | None) -> TaggingOptions:
     if not value:
         return TaggingOptions()
@@ -291,6 +295,7 @@ def _prepare_dataset(
     target_steps: int,
     source_dir: Path | None = None,
     custom_tags: str = "",
+    per_image_tags: list[dict] | None = None,
 ) -> tuple[Path, str, str, dict[str, str]]:
     paths = get_runtime_paths()
     
@@ -324,7 +329,14 @@ def _prepare_dataset(
     else:
         export_images(images, train_subset_dir)
 
-    if custom_tags and custom_tags.strip():
+    if per_image_tags:
+        for entry in per_image_tags:
+            idx = entry["index"]
+            img_file = train_subset_dir / f"image_{idx:03d}.png"
+            if img_file.exists():
+                caption_path = img_file.with_suffix(".txt")
+                caption_path.write_text(entry["positive_tags"].strip(), encoding="utf-8")
+    elif custom_tags and custom_tags.strip():
         # Write custom tags directly, skip WD14 tagging
         tag_text = custom_tags.strip()
         for img_file in sorted(train_subset_dir.iterdir()):
@@ -559,14 +571,10 @@ class InstantReferenceLoRA(io.ComfyNode):
             inputs=[
                 io.Model.Input("model"),
                 io.Clip.Input("clip"),
-                io.Image.Input("images").optional(),
-                io.String.Input("folder_path", default="").optional(),
                 io.Float.Input("model_strength", default=1.0),
                 io.Float.Input("clip_strength", default=1.0),
                 io.String.Input("profile", default=profile_keys[0] if profile_keys else ""),
                 io.Vae.Input("vae").optional(),
-                io.String.Input("custom_tags", default="", multiline=True).optional(),
-                io.String.Input("negative_prompt", default="", multiline=True).optional(),
                 io.String.Input("output_name", default=""),
             ],
             outputs=[
@@ -584,25 +592,22 @@ class InstantReferenceLoRA(io.ComfyNode):
         return profiles_fingerprint(profiles)
 
     @classmethod
-    def execute(cls, model, clip, images=None, folder_path="", model_strength=1.0, clip_strength=1.0, profile="", tagging_options=None, train_options=None, output_name="", custom_tags="", negative_prompt="", vae=None) -> io.NodeOutput:
+    def execute(cls, model, clip, model_strength=1.0, clip_strength=1.0, profile="", tagging_options=None, train_options=None, output_name="", vae=None, context=None) -> io.NodeOutput:
         return _execute_reference_lora(
             model,
             clip,
-            images,
             profile,
-            folder_path=folder_path,
             model_strength=model_strength,
             clip_strength=clip_strength,
             tagging_options=tagging_options,
             train_options=train_options,
             output_name=output_name,
-            custom_tags=custom_tags,
-            negative_prompt=negative_prompt,
             vae=vae,
+            context=context,
         )
 
 
-def _execute_reference_lora(model, clip, images, profile, folder_path="", model_strength=1.0, clip_strength=1.0, tagging_options=None, train_options=None, output_name="", custom_tags="", negative_prompt="", vae=None) -> io.NodeOutput:
+def _execute_reference_lora(model, clip, profile, model_strength=1.0, clip_strength=1.0, tagging_options=None, train_options=None, output_name="", vae=None, context=None) -> io.NodeOutput:
     # Support both string (profile key) and dict (legacy combo format)
     if isinstance(profile, str):
         profile_key = profile
@@ -614,6 +619,11 @@ def _execute_reference_lora(model, clip, images, profile, folder_path="", model_
     if vae is not None:
         slot_values["vae"] = vae
 
+    if context is None:
+        raise RuntimeError("context input is required. Connect a Context Builder node.")
+    images = context["images"]
+    per_image_tags = context["entries"]
+
     selected_profile = profile_map(_plugin_root())[profile_key]
     resolved_tagging = _tagging_options_from_input(tagging_options)
     resolved_train = _train_options_from_input(train_options)
@@ -622,15 +632,8 @@ def _execute_reference_lora(model, clip, images, profile, folder_path="", model_
     if model_slot is None:
         raise RuntimeError(f"Profile '{selected_profile.name}' must define a MODEL slot such as '{{{{model:MODEL}}}}'.")
     checkpoint_path = _recover_model_checkpoint_path(model)
-    
-    if folder_path and folder_path.strip():
-        source_dir = Path(folder_path.strip())
-        if not source_dir.exists() or not source_dir.is_dir():
-            raise RuntimeError(f"Specified folder_path does not exist or is not a directory: {folder_path}")
-        temp_image_hash = hash_directory_images(source_dir)
-    else:
-        source_dir = None
-        temp_image_hash = hash_tensor_batch(images)
+
+    temp_image_hash = hash_tensor_batch(images)
 
     paths = get_runtime_paths()
     temp_run_dir = ensure_dir(paths.cache / f"_inflight_{temp_image_hash}")
@@ -640,8 +643,7 @@ def _execute_reference_lora(model, clip, images, profile, folder_path="", model_
         log_path=temp_run_log,
         options=resolved_tagging,
         target_steps=target_steps,
-        source_dir=source_dir,
-        custom_tags=custom_tags,
+        per_image_tags=per_image_tags,
     )
 
     all_tags_text = "\n".join([v for k, v in captions.items()])
@@ -760,36 +762,30 @@ class InstantReferenceLoRAV1:
                 "profile": ("STRING", {"default": profiles[0].key if profiles else ""}),
             },
             "optional": {
-                "images": ("IMAGE",),
-                "folder_path": ("STRING", {"default": ""}),
+                "context": ("CONTEXT",),
                 **_all_optional_profile_inputs(),
                 "tagging_options": ("TAGGING_OPTIONS",),
                 "train_options": ("TRAIN_OPTIONS",),
                 "output_name": ("STRING", {"default": ""}),
-                "custom_tags": ("STRING", {"default": "", "multiline": True}),
-                "negative_prompt": ("STRING", {"default": "", "multiline": True}),
                 "vae": ("VAE",),
             },
         }
 
-    def run(self, model, clip, model_strength, clip_strength, profile, images=None, folder_path="", tagging_options=None, train_options=None, custom_tags="", negative_prompt="", vae=None, **kwargs):
+    def run(self, model, clip, model_strength, clip_strength, profile, context=None, tagging_options=None, train_options=None, vae=None, **kwargs):
         payload = {"profile": profile}
         output_name = kwargs.pop("output_name", "")
         payload.update(kwargs)
         output = _execute_reference_lora(
             model,
             clip,
-            images,
             payload,
-            folder_path=folder_path,
             model_strength=model_strength,
             clip_strength=clip_strength,
             tagging_options=tagging_options,
             train_options=train_options,
             output_name=output_name,
-            custom_tags=custom_tags,
-            negative_prompt=negative_prompt,
             vae=vae,
+            context=context,
         )
         return output.result
 
@@ -847,14 +843,66 @@ class TrainOptionsV1:
         return (kwargs,)
 
 
+class ContextBuilderV1:
+    CATEGORY = "reference/training"
+    RETURN_TYPES = ("CONTEXT",)
+    RETURN_NAMES = ("context",)
+    FUNCTION = "build"
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "positive_prompt": ("STRING", {"default": "", "multiline": True}),
+                "negative_prompt": ("STRING", {"default": "", "multiline": True}),
+                "images": ("IMAGE",),
+            }
+        }
+
+    def build(self, positive_prompt, negative_prompt, images):
+        pos_groups = _parse_prompt_groups(positive_prompt)
+        neg_groups = _parse_prompt_groups(negative_prompt)
+        num_images = images.shape[0]
+
+        if not pos_groups:
+            raise RuntimeError(
+                "Positive prompt must contain at least one [tag group]. "
+                "Format: [tag1, tag2], [tag3, tag4], ..."
+            )
+
+        if len(pos_groups) != num_images:
+            raise RuntimeError(
+                f"Positive prompt has {len(pos_groups)} [groups] but {num_images} images. "
+                f"Each [group] must match one image."
+            )
+
+        if neg_groups and len(neg_groups) != num_images:
+            raise RuntimeError(
+                f"Negative prompt has {len(neg_groups)} [groups] but {num_images} images. "
+                f"Each [group] must match one image."
+            )
+
+        entries = []
+        for i in range(num_images):
+            entries.append({
+                "index": i,
+                "positive_tags": pos_groups[i],
+                "negative_tags": neg_groups[i] if i < len(neg_groups) else "",
+            })
+
+        return ({"images": images, "entries": entries},)
+
+
 NODE_CLASS_MAPPINGS = {
     "md_soya_InstantReferenceLoRA": InstantReferenceLoRAV1,
+    "md_soya_ContextBuilder": ContextBuilderV1,
     "md_soya_ReferenceTaggingOptions": TaggingOptionsV1,
     "md_soya_ReferenceTrainOptions": TrainOptionsV1,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "md_soya_InstantReferenceLoRA": "md_soya Instant Reference LoRA",
+    "md_soya_ContextBuilder": "md_soya Context Builder",
     "md_soya_ReferenceTaggingOptions": "md_soya Reference Tagging Options",
     "md_soya_ReferenceTrainOptions": "md_soya Reference Train Options",
 }
