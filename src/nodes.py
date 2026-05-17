@@ -7,6 +7,7 @@ import re
 import secrets
 import shutil
 import tempfile
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -562,6 +563,7 @@ def _execute_reference_lora(
     preview_enable=False, preview_prompt_index=0, preview_seed=42,
     preview_steps=20, preview_cfg=7.0, preview_sampler="euler", preview_scheduler="normal",
     preview_width=512, preview_height=512,
+    preview_positive_prompt="", preview_negative_prompt="",
 ) -> tuple:
     print("[md_soya] _execute_reference_lora called")
     # Support both string (profile key) and dict (legacy combo format)
@@ -696,12 +698,18 @@ def _execute_reference_lora(
 
     # --- Post-hoc preview: sample all checkpoints after training ---
     preview_images = []
-    preview_map: dict[Path, Any] = {}
+    preview_map: dict[Path, list] = {}  # ckpt_path -> [(prompt_index, img_tensor), ...]
+    parsed_pos = _parse_prompt_groups(preview_positive_prompt) if preview_positive_prompt else []
+    parsed_neg = _parse_prompt_groups(preview_negative_prompt) if preview_negative_prompt else []
+
     if preview_enable and vae is not None:
         try:
             checkpoints = sorted(output_dir.glob("*.safetensors"), key=lambda p: p.stat().st_mtime)
-            print(f"[md_soya] Post-hoc preview: found {len(checkpoints)} checkpoints")
-            _notify_phase(f"Generating previews ({len(checkpoints)} checkpoints)...")
+            num_prompts_per_ckpt = len(parsed_pos) if parsed_pos else 1
+            total_previews = len(checkpoints) * num_prompts_per_ckpt
+            print(f"[md_soya] Post-hoc preview: found {len(checkpoints)} checkpoints, {num_prompts_per_ckpt} prompts each = {total_previews} total")
+            _notify_phase(f"Preview 0/{total_previews}...")
+            t_preview_start = time.monotonic()
             for ckpt in checkpoints:
                 print(f"[md_soya] Sampling preview for {ckpt.name}...")
                 try:
@@ -713,24 +721,53 @@ def _execute_reference_lora(
                         model, clip, str(ckpt), model_strength, clip_strength
                     )
 
-                    entries = context.get("entries", [])
-                    idx = min(preview_prompt_index, len(entries) - 1) if entries else 0
-                    entry = entries[idx] if entries else {"positive_tags": "", "negative_tags": ""}
-
                     w = preview_width if preview_width > 0 else (context["images"].shape[2] if "images" in context else 512)
                     h = preview_height if preview_height > 0 else (context["images"].shape[1] if "images" in context else 512)
 
-                    img = generate_preview(
-                        m_patched, c_patched, vae,
-                        entry.get("positive_tags", ""), entry.get("negative_tags", ""),
-                        w, h,
-                        preview_seed + len(preview_images),
-                        preview_steps, preview_cfg,
-                        preview_sampler, preview_scheduler,
-                    )
-                    preview_images.append(img)
-                    preview_map[ckpt] = img
-                    print(f"[md_soya] Preview done for {ckpt.name}: {img.shape}")
+                    preview_map[ckpt] = []
+                    if parsed_pos:
+                        # Multi-prompt mode: generate one preview per prompt group
+                        for pi, pos_text in enumerate(parsed_pos):
+                            neg_text = parsed_neg[pi] if pi < len(parsed_neg) else (parsed_neg[-1] if parsed_neg else "")
+                            img = generate_preview(
+                                m_patched, c_patched, vae,
+                                pos_text, neg_text,
+                                w, h,
+                                preview_seed + len(preview_images),
+                                preview_steps, preview_cfg,
+                                preview_sampler, preview_scheduler,
+                            )
+                            preview_images.append(img)
+                            preview_map[ckpt].append((pi + 1, img))
+                            done = len(preview_images)
+                            elapsed = time.monotonic() - t_preview_start
+                            avg_s = elapsed / done
+                            remain_s = avg_s * (total_previews - done)
+                            remain_m = remain_s / 60
+                            _notify_phase(f"Preview {done}/{total_previews} (~{remain_m:.1f}min left)")
+                            print(f"[md_soya] Preview done for {ckpt.name} [{pi+1}/{len(parsed_pos)}] ({done}/{total_previews}): {img.shape}")
+                    else:
+                        # Legacy single-prompt mode
+                        entries = context.get("entries", [])
+                        idx = min(preview_prompt_index, len(entries) - 1) if entries else 0
+                        entry = entries[idx] if entries else {"positive_tags": "", "negative_tags": ""}
+                        img = generate_preview(
+                            m_patched, c_patched, vae,
+                            entry.get("positive_tags", ""), entry.get("negative_tags", ""),
+                            w, h,
+                            preview_seed + len(preview_images),
+                            preview_steps, preview_cfg,
+                            preview_sampler, preview_scheduler,
+                        )
+                        preview_images.append(img)
+                        preview_map[ckpt].append((0, img))
+                        done = len(preview_images)
+                        elapsed = time.monotonic() - t_preview_start
+                        avg_s = elapsed / done
+                        remain_s = avg_s * (total_previews - done)
+                        remain_m = remain_s / 60
+                        _notify_phase(f"Preview {done}/{total_previews} (~{remain_m:.1f}min left)")
+                        print(f"[md_soya] Preview done for {ckpt.name} ({done}/{total_previews}): {img.shape}")
                 except Exception as exc:
                     print(f"[md_soya] Preview failed for {ckpt.name}: {exc}")
                     continue
@@ -740,20 +777,35 @@ def _execute_reference_lora(
         except Exception as exc:
             print(f"[md_soya] Post-hoc preview error: {exc}")
 
-    # --- Save preview JPG and config TOML for each checkpoint ---
+    # --- Save preview JPGs, config TOML, and JSON mapping for each checkpoint ---
     import gc
     gc.collect()
     from PIL import Image as PILImage
 
     for ckpt_path in sorted(output_dir.glob("*.safetensors"), key=lambda p: p.stat().st_mtime):
-        base = ckpt_path.stem  # e.g. "b4bd9ced_00000050" or "b4bd9ced"
+        base = ckpt_path.stem  # e.g. "7cfdab8d" or "7cfdab8d-step00000025"
 
-        if ckpt_path in preview_map:
-            img_tensor = preview_map[ckpt_path]
+        previews_for_ckpt = preview_map.get(ckpt_path, [])
+        preview_filenames = []
+        for pidx, img_tensor in previews_for_ckpt:
+            if pidx > 0:
+                jpg_name = f"{base}-{pidx}.jpg"
+            else:
+                jpg_name = f"{base}.jpg"
             img_np = (img_tensor[0].cpu().numpy() * 255).astype("uint8")
-            PILImage.fromarray(img_np).save(str(output_dir / f"{base}.jpg"))
+            PILImage.fromarray(img_np).save(str(output_dir / jpg_name))
+            preview_filenames.append(jpg_name)
 
         shutil.copy2(config_path, output_dir / f"{base}.toml")
+
+        write_json(
+            output_dir / f"{base}.json",
+            {
+                "lora_file": ckpt_path.name,
+                "config_file": f"{base}.toml",
+                "previews": preview_filenames,
+            },
+        )
 
     _record_last_lora(trained_lora)
 
@@ -812,6 +864,8 @@ class MdSoyaInstantReferenceLoRA(io.ComfyNode):
                 io.String.Input("preview_scheduler", default="normal"),
                 io.Int.Input("preview_width", default=512),
                 io.Int.Input("preview_height", default=512),
+                io.String.Input("preview_positive_prompt", default="", multiline=True),
+                io.String.Input("preview_negative_prompt", default="", multiline=True),
             ],
             outputs=[
                 io.String.Output(display_name="info"),
@@ -825,7 +879,7 @@ class MdSoyaInstantReferenceLoRA(io.ComfyNode):
         return profiles_fingerprint(profiles)
 
     @classmethod
-    def execute(cls, model, clip, model_strength=1.0, clip_strength=1.0, profile="", tagging_options=None, train_options=None, save_path="", vae=None, context=None, preview_enable=False, preview_prompt_index=0, preview_seed=42, preview_steps=20, preview_cfg=7.0, preview_sampler="euler", preview_scheduler="normal", preview_width=512, preview_height=512) -> io.NodeOutput:
+    def execute(cls, model, clip, model_strength=1.0, clip_strength=1.0, profile="", tagging_options=None, train_options=None, save_path="", vae=None, context=None, preview_enable=False, preview_prompt_index=0, preview_seed=42, preview_steps=20, preview_cfg=7.0, preview_sampler="euler", preview_scheduler="normal", preview_width=512, preview_height=512, preview_positive_prompt="", preview_negative_prompt="") -> io.NodeOutput:
         info, preview_batch = _execute_reference_lora(
             model,
             clip,
@@ -846,6 +900,8 @@ class MdSoyaInstantReferenceLoRA(io.ComfyNode):
             preview_scheduler=preview_scheduler,
             preview_width=preview_width,
             preview_height=preview_height,
+            preview_positive_prompt=preview_positive_prompt,
+            preview_negative_prompt=preview_negative_prompt,
         )
         return io.NodeOutput(info, preview_batch)
 class ReferenceTrainingExtension(ComfyExtension):
@@ -886,10 +942,12 @@ class InstantReferenceLoRAV1:
                 "preview_scheduler": (["normal", "karras", "exponential", "sgm_uniform", "simple", "ddim_uniform", "beta"], {"default": "normal"}),
                 "preview_width": ("INT", {"default": 512, "min": 16, "max": 4096, "step": 8}),
                 "preview_height": ("INT", {"default": 512, "min": 16, "max": 4096, "step": 8}),
+                "preview_positive_prompt": ("STRING", {"default": "", "multiline": True}),
+                "preview_negative_prompt": ("STRING", {"default": "", "multiline": True}),
             },
         }
 
-    def run(self, model, clip, model_strength, clip_strength, profile, context, vae=None, save_path="", tagging_options=None, train_options=None, preview_enable=False, preview_prompt_index=0, preview_seed=42, preview_steps=20, preview_cfg=7.0, preview_sampler="euler", preview_scheduler="normal", preview_width=512, preview_height=512):
+    def run(self, model, clip, model_strength, clip_strength, profile, context, vae=None, save_path="", tagging_options=None, train_options=None, preview_enable=False, preview_prompt_index=0, preview_seed=42, preview_steps=20, preview_cfg=7.0, preview_sampler="euler", preview_scheduler="normal", preview_width=512, preview_height=512, preview_positive_prompt="", preview_negative_prompt=""):
         print(f"[md_soya] === Instant Reference LoRA started ===")
         print(f"[md_soya] profile={profile}, context={'provided' if context else 'None'}, vae={'provided' if vae else 'None'}")
         print(f"[md_soya] model_strength={model_strength}, clip_strength={clip_strength}, save_path={save_path}")
@@ -915,6 +973,8 @@ class InstantReferenceLoRAV1:
                 preview_scheduler=preview_scheduler,
                 preview_width=preview_width,
                 preview_height=preview_height,
+                preview_positive_prompt=preview_positive_prompt,
+                preview_negative_prompt=preview_negative_prompt,
             )
             print(f"[md_soya] === completed ===\n{info}")
             if preview_batch is None:
