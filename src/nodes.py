@@ -39,6 +39,20 @@ from .sampling import generate_preview, patch_lora_onto_models
 NODE_VERSION = "0.1.4"
 MAX_TRAIN_STEPS_PATTERN = re.compile(r"^\s*max_train_steps\s*=\s*(\d+)\s*$", re.MULTILINE)
 MIXED_PRECISION_PATTERN = re.compile(r'^\s*mixed_precision\s*=\s*"([^"]+)"\s*$', re.MULTILINE)
+_TRAIN_STEP_RE = re.compile(r'\|\s*(\d+)/(\d+)\s')
+
+
+def _notify_phase(text: str) -> None:
+    """Send a phase/status text to display on the executing node in ComfyUI."""
+    try:
+        from server import PromptServer
+        server = PromptServer.instance
+        if server is not None:
+            node_id = getattr(server, 'last_node_id', None)
+            if node_id is not None:
+                server.send_progress_text(text, node_id)
+    except Exception:
+        pass
 
 
 @io.comfytype(io_type="CONTEXT")
@@ -493,7 +507,7 @@ def _write_resolved_config(
     return config_path
 
 
-def _run_training(profile: ProfileDefinition, run_dir: Path, output_dir: Path, config_path: Path, log_path: Path) -> Path:
+def _run_training(profile: ProfileDefinition, run_dir: Path, output_dir: Path, config_path: Path, log_path: Path, total_steps: int | None = None) -> Path:
     paths = get_runtime_paths()
     ensure_sd_scripts_environment(paths, log_path=log_path)
     python_path = venv_python(paths.venv)
@@ -512,7 +526,18 @@ def _run_training(profile: ProfileDefinition, run_dir: Path, output_dir: Path, c
         if mixed_precision is not None:
             command.extend(["--mixed_precision", mixed_precision])
     command.extend([str(training_script), "--config_file", str(config_path)])
-    run_command(command, cwd=paths.sd_scripts, log_path=log_path)
+
+    pbar = comfy.utils.ProgressBar(total_steps) if total_steps and total_steps > 0 else None
+
+    def on_line(text):
+        if pbar is not None:
+            match = _TRAIN_STEP_RE.search(text)
+            if match:
+                current = int(match.group(1))
+                total = int(match.group(2))
+                pbar.update_absolute(current, total)
+
+    run_command(command, cwd=paths.sd_scripts, log_path=log_path, line_callback=on_line)
     trained_lora = latest_safetensors(output_dir)
     if trained_lora is None:
         raise RuntimeError(f"Training completed but no LoRA file was found in {output_dir}")
@@ -581,6 +606,7 @@ def _execute_reference_lora(
     temp_run_dir = ensure_dir(paths.cache / f"_inflight_{temp_image_hash}")
     temp_run_log = temp_run_dir / "run.log"
     print("[md_soya] preparing dataset...")
+    _notify_phase("Preparing dataset...")
     dataset_dir, image_hash, captions_hash, captions = _prepare_dataset(
         images,
         log_path=temp_run_log,
@@ -632,6 +658,14 @@ def _execute_reference_lora(
     manifest = run_dir / "manifest.json"
 
     print("[md_soya] starting training...")
+    _notify_phase(f"Training ({target_steps} steps)...")
+    # Clear previous output artifacts before training
+    for old_ckpt in output_dir.glob("*.safetensors"):
+        try:
+            old_ckpt.unlink()
+            print(f"[md_soya] removed old checkpoint: {old_ckpt.name}")
+        except OSError:
+            pass
     ensure_sd_scripts_environment(paths, log_path=run_log)
     builtins = _builtins_for_run(dataset_dir, output_dir, output_name)
     config_path = _write_resolved_config(selected_profile, resolved_slots, builtins, run_dir, resolved_train)
@@ -663,8 +697,9 @@ def _execute_reference_lora(
     if callable(soft_empty_cache):
         soft_empty_cache()
     print("[md_soya] calling _run_training...")
-    trained_lora = _run_training(selected_profile, run_dir, output_dir, config_path, log_path=run_log)
+    trained_lora = _run_training(selected_profile, run_dir, output_dir, config_path, log_path=run_log, total_steps=target_steps)
     print(f"[md_soya] training done, lora={trained_lora}")
+    _notify_phase("Training complete!")
 
     _record_last_lora(trained_lora)
     info = f"[trained] {trained_lora.name} -> {trained_lora}"
@@ -677,6 +712,7 @@ def _execute_reference_lora(
         try:
             checkpoints = sorted(output_dir.glob("*.safetensors"), key=lambda p: p.stat().st_mtime)
             print(f"[md_soya] Post-hoc preview: found {len(checkpoints)} checkpoints")
+            _notify_phase(f"Generating previews ({len(checkpoints)} checkpoints)...")
             for ckpt in checkpoints:
                 print(f"[md_soya] Sampling preview for {ckpt.name}...")
                 try:

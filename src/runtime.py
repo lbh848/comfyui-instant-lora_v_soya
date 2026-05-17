@@ -395,7 +395,7 @@ def _terminate_process_tree(process: subprocess.Popen, log_handle) -> None:
         logging.warning("Failed to terminate child process tree for pid %s: %s", process.pid, exc)
 
 
-def run_command(command: list[str], cwd: Path, log_path: Path | None = None, env: dict[str, str] | None = None) -> None:
+def run_command(command: list[str], cwd: Path, log_path: Path | None = None, env: dict[str, str] | None = None, line_callback=None) -> None:
     merged_env = os.environ.copy()
     merged_env.setdefault("PYTHONUTF8", "1")
     merged_env.setdefault("PYTHONIOENCODING", "utf-8")
@@ -484,6 +484,8 @@ def run_command(command: list[str], cwd: Path, log_path: Path | None = None, env
                 recent_output.append(text)
                 if len(recent_output) > 80:
                     recent_output = recent_output[-80:]
+                if line_callback is not None:
+                    line_callback(text)
 
         return_code = process.wait()
         if log_handle is not None:
