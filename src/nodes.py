@@ -536,6 +536,7 @@ def _run_training(profile: ProfileDefinition, run_dir: Path, output_dir: Path, c
                 current = int(match.group(1))
                 total = int(match.group(2))
                 pbar.update_absolute(current, total)
+                _notify_phase(f"Training step {current}/{total}")
 
     run_command(command, cwd=paths.sd_scripts, log_path=log_path, line_callback=on_line)
     trained_lora = latest_safetensors(output_dir)
