@@ -5,7 +5,6 @@ import comfy.model_management
 import comfy.sd
 import comfy.sample
 import comfy.utils
-import comfy.latent_preview as latent_preview
 
 
 def patch_lora_onto_models(model, clip, lora_path: str, strength_model: float, strength_clip: float):
@@ -34,13 +33,12 @@ def sample_latent(model, seed, steps, cfg, sampler_name, scheduler, positive, ne
     latent_image = latent["samples"]
     latent_image = comfy.sample.fix_empty_latent_channels(model, latent_image, latent.get("downscale_ratio_spacial", None))
     noise = comfy.sample.prepare_noise(latent_image, seed, None)
-    callback = latent_preview.prepare_callback(model, steps)
     disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
     samples = comfy.sample.sample(
         model, noise, steps, cfg, sampler_name, scheduler,
         positive, negative, latent_image,
         denoise=denoise, disable_noise=False,
-        noise_mask=None, callback=callback, disable_pbar=disable_pbar, seed=seed
+        noise_mask=None, callback=None, disable_pbar=disable_pbar, seed=seed
     )
     out = latent.copy()
     out.pop("downscale_ratio_spacial", None)

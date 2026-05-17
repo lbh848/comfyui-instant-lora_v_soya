@@ -32,6 +32,8 @@ from .runtime import (
     venv_python,
     write_json,
 )
+import torch
+from .sampling import generate_preview, patch_lora_onto_models
 
 
 NODE_VERSION = "0.1.4"
@@ -660,43 +662,30 @@ def _execute_reference_lora(
     soft_empty_cache = getattr(comfy.model_management, "soft_empty_cache", None)
     if callable(soft_empty_cache):
         soft_empty_cache()
+    print("[md_soya] calling _run_training...")
+    trained_lora = _run_training(selected_profile, run_dir, output_dir, config_path, log_path=run_log)
+    print(f"[md_soya] training done, lora={trained_lora}")
 
-    # --- Run training in a background thread ---
-    training_result = {"lora_path": None, "error": None}
+    _record_last_lora(trained_lora)
+    info = f"[trained] {trained_lora.name} -> {trained_lora}"
+    if all_tags_text:
+        info += f"\ntags: {all_tags_text}"
 
-    def _training_thread():
-        try:
-            training_result["lora_path"] = _run_training(selected_profile, run_dir, output_dir, config_path, log_path=run_log)
-        except Exception as exc:
-            training_result["error"] = exc
-
-    train_thread = threading.Thread(target=_training_thread)
-    train_thread.start()
-
-    # --- Watchdog: poll output_dir for new safetensors while training ---
-    preview_images: list = []
+    # --- Post-hoc preview: sample all checkpoints after training ---
+    preview_images = []
     if preview_enable and vae is not None:
-        seen_checkpoints: set[str] = set()
-        print("[md_soya] preview watchdog started")
-        while train_thread.is_alive():
-            train_thread.join(timeout=5.0)
-            try:
-                current_ckpts = sorted(output_dir.glob("*.safetensors"), key=lambda p: p.stat().st_mtime)
-            except OSError:
-                current_ckpts = []
-            for ckpt in current_ckpts:
-                ckpt_str = str(ckpt)
-                if ckpt_str in seen_checkpoints:
-                    continue
-                seen_checkpoints.add(ckpt_str)
-                print(f"[md_soya] New checkpoint detected: {ckpt.name}, running preview...")
+        try:
+            checkpoints = sorted(output_dir.glob("*.safetensors"), key=lambda p: p.stat().st_mtime)
+            print(f"[md_soya] Post-hoc preview: found {len(checkpoints)} checkpoints")
+            for ckpt in checkpoints:
+                print(f"[md_soya] Sampling preview for {ckpt.name}...")
                 try:
                     comfy.model_management.unload_all_models()
                     if callable(soft_empty_cache):
                         soft_empty_cache()
 
                     m_patched, c_patched = patch_lora_onto_models(
-                        model, clip, ckpt_str, model_strength, clip_strength
+                        model, clip, str(ckpt), model_strength, clip_strength
                     )
 
                     entries = context.get("entries", [])
@@ -715,32 +704,21 @@ def _execute_reference_lora(
                         preview_sampler, preview_scheduler,
                     )
                     preview_images.append(img)
-                    print(f"[md_soya] Preview generated for {ckpt.name} ({img.shape})")
+                    print(f"[md_soya] Preview done for {ckpt.name}: {img.shape}")
                 except Exception as exc:
                     print(f"[md_soya] Preview failed for {ckpt.name}: {exc}")
                     continue
-        print(f"[md_soya] preview watchdog finished, generated {len(preview_images)} previews")
-    else:
-        train_thread.join()
-
-    if training_result["error"] is not None:
-        raise training_result["error"]
-
-    trained_lora = training_result["lora_path"]
-    if trained_lora is None:
-        raise RuntimeError("Training thread did not produce a LoRA path")
-    print(f"[md_soya] training done, lora={trained_lora}")
-
-    _record_last_lora(trained_lora)
-    info = f"[trained] {trained_lora.name} -> {trained_lora}"
-    if all_tags_text:
-        info += f"\ntags: {all_tags_text}"
+                finally:
+                    del m_patched, c_patched
+                    comfy.model_management.unload_all_models()
+        except Exception as exc:
+            print(f"[md_soya] Post-hoc preview error: {exc}")
 
     if preview_images:
         preview_batch = torch.cat(preview_images, dim=0)
     else:
         preview_batch = None
-    return info
+    return info, preview_batch
 
 
 def _profile_choice_inputs(profile: ProfileDefinition) -> list[Any]:
@@ -789,8 +767,8 @@ class MdSoyaInstantReferenceLoRA(io.ComfyNode):
                 io.Int.Input("preview_height", default=512),
             ],
             outputs=[
-                io.Image.Output("preview_images"),
                 io.String.Output(display_name="info"),
+                io.Image.Output("preview_images"),
             ],
         )
 
@@ -801,7 +779,7 @@ class MdSoyaInstantReferenceLoRA(io.ComfyNode):
 
     @classmethod
     def execute(cls, model, clip, model_strength=1.0, clip_strength=1.0, profile="", tagging_options=None, train_options=None, output_name="", vae=None, context=None, preview_enable=False, preview_prompt_index=0, preview_seed=42, preview_steps=20, preview_cfg=7.0, preview_sampler="euler", preview_scheduler="normal", preview_width=512, preview_height=512) -> io.NodeOutput:
-        preview_batch, info = _execute_reference_lora(
+        info, preview_batch = _execute_reference_lora(
             model,
             clip,
             profile,
@@ -822,7 +800,7 @@ class MdSoyaInstantReferenceLoRA(io.ComfyNode):
             preview_width=preview_width,
             preview_height=preview_height,
         )
-        return io.NodeOutput(preview_batch, info)
+        return io.NodeOutput(info, preview_batch)
 class ReferenceTrainingExtension(ComfyExtension):
     async def get_node_list(self) -> list[type[io.ComfyNode]]:
         return [MdSoyaInstantReferenceLoRA]
@@ -831,8 +809,8 @@ class ReferenceTrainingExtension(ComfyExtension):
 # V1 wrapper for NODE_CLASS_MAPPINGS compatibility
 class InstantReferenceLoRAV1:
     CATEGORY = "reference/training"
-    RETURN_TYPES = ("IMAGE", "STRING",)
-    RETURN_NAMES = ("preview_images", "info",)
+    RETURN_TYPES = ("STRING", "IMAGE",)
+    RETURN_NAMES = ("info", "preview_images",)
     FUNCTION = "run"
 
     @classmethod
@@ -870,7 +848,7 @@ class InstantReferenceLoRAV1:
         print(f"[md_soya] model_strength={model_strength}, clip_strength={clip_strength}, output_name={output_name}")
         print(f"[md_soya] preview_enable={preview_enable}, preview_prompt_index={preview_prompt_index}")
         try:
-            preview_batch, info = _execute_reference_lora(
+            info, preview_batch = _execute_reference_lora(
                 model,
                 clip,
                 profile,
@@ -893,8 +871,8 @@ class InstantReferenceLoRAV1:
             )
             print(f"[md_soya] === completed ===\n{info}")
             if preview_batch is None:
-                preview_batch = torch.zeros((1, 64, 64, 3), device="cpu")
-            return (preview_batch, info,)
+                preview_batch = torch.zeros((1, 64, 64, 3), device=comfy.model_management.intermediate_device())
+            return (info, preview_batch,)
         except Exception as e:
             import traceback
             print(f"[md_soya] === ERROR ===\n{traceback.format_exc()}")
