@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//e/wsl2/matrix/Packages/ComfyUI/**)",
+      "Bash(python -c \"import sys; sys.path.insert\\(0, ''''.''''\\); from custom_nodes.comfyui-instant-lora_v_soya.src.nodes import NODE_CLASS_MAPPINGS; print\\(''''NODE_CLASS_MAPPINGS:'''', list\\(NODE_CLASS_MAPPINGS.keys\\(\\)\\)\\)\")",
+      "Bash(python -c \":*)",
+      "Bash(ls E:/wsl2/matrix/Packages/ComfyUI/log*)",
+      "Bash(ls E:/wsl2/matrix/Packages/ComfyUI/custom_nodes/comfyui-instant-lora_v_soya/runtime/*.log)",
+      "Bash(find E:/wsl2/matrix/Packages/ComfyUI -maxdepth 1 -name *.log -o -name output -type d)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)"
+    ]
+  }
+}

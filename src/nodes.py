@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import hashlib
 import json
@@ -526,7 +526,15 @@ def _record_last_lora(lora_path: Path) -> None:
     )
 
 
-def _execute_reference_lora(model, clip, profile, model_strength=1.0, clip_strength=1.0, tagging_options=None, train_options=None, output_name="", vae=None, context=None) -> str:
+def _execute_reference_lora(
+    model, clip, profile,
+    model_strength=1.0, clip_strength=1.0,
+    tagging_options=None, train_options=None,
+    output_name="", vae=None, context=None,
+    preview_enable=False, preview_prompt_index=0, preview_seed=42,
+    preview_steps=20, preview_cfg=7.0, preview_sampler="euler", preview_scheduler="normal",
+    preview_width=512, preview_height=512,
+) -> tuple:
     print("[md_soya] _execute_reference_lora called")
     # Support both string (profile key) and dict (legacy combo format)
     if isinstance(profile, str):
@@ -640,18 +648,98 @@ def _execute_reference_lora(model, clip, profile, model_strength=1.0, clip_stren
             "config_path": str(config_path),
         },
     )
+    # --- preview auto-save_every_n_steps injection ---
+    if preview_enable and resolved_train.save_every_n_steps <= 0:
+        auto_save_every = max(1, target_steps // 4)
+        config_text = config_path.read_text(encoding="utf-8")
+        config_text = _set_toml_key(config_text, "save_every_n_steps", auto_save_every)
+        config_path.write_text(config_text, encoding="utf-8")
+        print(f"[md_soya] preview enabled, auto save_every_n_steps={auto_save_every}")
+
     comfy.model_management.unload_all_models()
     soft_empty_cache = getattr(comfy.model_management, "soft_empty_cache", None)
     if callable(soft_empty_cache):
         soft_empty_cache()
-    print("[md_soya] calling _run_training...")
-    trained_lora = _run_training(selected_profile, run_dir, output_dir, config_path, log_path=run_log)
+
+    # --- Run training in a background thread ---
+    training_result = {"lora_path": None, "error": None}
+
+    def _training_thread():
+        try:
+            training_result["lora_path"] = _run_training(selected_profile, run_dir, output_dir, config_path, log_path=run_log)
+        except Exception as exc:
+            training_result["error"] = exc
+
+    train_thread = threading.Thread(target=_training_thread)
+    train_thread.start()
+
+    # --- Watchdog: poll output_dir for new safetensors while training ---
+    preview_images: list = []
+    if preview_enable and vae is not None:
+        seen_checkpoints: set[str] = set()
+        print("[md_soya] preview watchdog started")
+        while train_thread.is_alive():
+            train_thread.join(timeout=5.0)
+            try:
+                current_ckpts = sorted(output_dir.glob("*.safetensors"), key=lambda p: p.stat().st_mtime)
+            except OSError:
+                current_ckpts = []
+            for ckpt in current_ckpts:
+                ckpt_str = str(ckpt)
+                if ckpt_str in seen_checkpoints:
+                    continue
+                seen_checkpoints.add(ckpt_str)
+                print(f"[md_soya] New checkpoint detected: {ckpt.name}, running preview...")
+                try:
+                    comfy.model_management.unload_all_models()
+                    if callable(soft_empty_cache):
+                        soft_empty_cache()
+
+                    m_patched, c_patched = patch_lora_onto_models(
+                        model, clip, ckpt_str, model_strength, clip_strength
+                    )
+
+                    entries = context.get("entries", [])
+                    idx = min(preview_prompt_index, len(entries) - 1) if entries else 0
+                    entry = entries[idx] if entries else {"positive_tags": "", "negative_tags": ""}
+
+                    w = preview_width if preview_width > 0 else (context["images"].shape[2] if "images" in context else 512)
+                    h = preview_height if preview_height > 0 else (context["images"].shape[1] if "images" in context else 512)
+
+                    img = generate_preview(
+                        m_patched, c_patched, vae,
+                        entry.get("positive_tags", ""), entry.get("negative_tags", ""),
+                        w, h,
+                        preview_seed + len(preview_images),
+                        preview_steps, preview_cfg,
+                        preview_sampler, preview_scheduler,
+                    )
+                    preview_images.append(img)
+                    print(f"[md_soya] Preview generated for {ckpt.name} ({img.shape})")
+                except Exception as exc:
+                    print(f"[md_soya] Preview failed for {ckpt.name}: {exc}")
+                    continue
+        print(f"[md_soya] preview watchdog finished, generated {len(preview_images)} previews")
+    else:
+        train_thread.join()
+
+    if training_result["error"] is not None:
+        raise training_result["error"]
+
+    trained_lora = training_result["lora_path"]
+    if trained_lora is None:
+        raise RuntimeError("Training thread did not produce a LoRA path")
     print(f"[md_soya] training done, lora={trained_lora}")
 
     _record_last_lora(trained_lora)
     info = f"[trained] {trained_lora.name} -> {trained_lora}"
     if all_tags_text:
         info += f"\ntags: {all_tags_text}"
+
+    if preview_images:
+        preview_batch = torch.cat(preview_images, dim=0)
+    else:
+        preview_batch = None
     return info
 
 
@@ -665,6 +753,7 @@ def _profile_choice_inputs(profile: ProfileDefinition) -> list[Any]:
         elif slot.slot_type == "VAE":
             inputs.append(io.Vae.Input(slot.name))
     return inputs
+
 
 
 class MdSoyaInstantReferenceLoRA(io.ComfyNode):
@@ -689,8 +778,18 @@ class MdSoyaInstantReferenceLoRA(io.ComfyNode):
                 io.String.Input("output_name", default=""),
                 TaggingOptionsType.Input("tagging_options", optional=True),
                 TrainOptionsType.Input("train_options", optional=True),
+                io.Boolean.Input("preview_enable", default=False),
+                io.Int.Input("preview_prompt_index", default=0),
+                io.Int.Input("preview_seed", default=42),
+                io.Int.Input("preview_steps", default=20),
+                io.Float.Input("preview_cfg", default=7.0),
+                io.String.Input("preview_sampler", default="euler"),
+                io.String.Input("preview_scheduler", default="normal"),
+                io.Int.Input("preview_width", default=512),
+                io.Int.Input("preview_height", default=512),
             ],
             outputs=[
+                io.Image.Output("preview_images"),
                 io.String.Output(display_name="info"),
             ],
         )
@@ -701,8 +800,8 @@ class MdSoyaInstantReferenceLoRA(io.ComfyNode):
         return profiles_fingerprint(profiles)
 
     @classmethod
-    def execute(cls, model, clip, model_strength=1.0, clip_strength=1.0, profile="", tagging_options=None, train_options=None, output_name="", vae=None, context=None) -> io.NodeOutput:
-        info = _execute_reference_lora(
+    def execute(cls, model, clip, model_strength=1.0, clip_strength=1.0, profile="", tagging_options=None, train_options=None, output_name="", vae=None, context=None, preview_enable=False, preview_prompt_index=0, preview_seed=42, preview_steps=20, preview_cfg=7.0, preview_sampler="euler", preview_scheduler="normal", preview_width=512, preview_height=512) -> io.NodeOutput:
+        preview_batch, info = _execute_reference_lora(
             model,
             clip,
             profile,
@@ -713,10 +812,17 @@ class MdSoyaInstantReferenceLoRA(io.ComfyNode):
             output_name=output_name,
             vae=vae,
             context=context,
+            preview_enable=preview_enable,
+            preview_prompt_index=preview_prompt_index,
+            preview_seed=preview_seed,
+            preview_steps=preview_steps,
+            preview_cfg=preview_cfg,
+            preview_sampler=preview_sampler,
+            preview_scheduler=preview_scheduler,
+            preview_width=preview_width,
+            preview_height=preview_height,
         )
-        return io.NodeOutput(info)
-
-
+        return io.NodeOutput(preview_batch, info)
 class ReferenceTrainingExtension(ComfyExtension):
     async def get_node_list(self) -> list[type[io.ComfyNode]]:
         return [MdSoyaInstantReferenceLoRA]
@@ -725,8 +831,8 @@ class ReferenceTrainingExtension(ComfyExtension):
 # V1 wrapper for NODE_CLASS_MAPPINGS compatibility
 class InstantReferenceLoRAV1:
     CATEGORY = "reference/training"
-    RETURN_TYPES = ("STRING",)
-    RETURN_NAMES = ("info",)
+    RETURN_TYPES = ("IMAGE", "STRING",)
+    RETURN_NAMES = ("preview_images", "info",)
     FUNCTION = "run"
 
     @classmethod
@@ -746,15 +852,25 @@ class InstantReferenceLoRAV1:
                 "output_name": ("STRING", {"default": "", "multiline": False}),
                 "tagging_options": ("TAGGING_OPTIONS",),
                 "train_options": ("TRAIN_OPTIONS",),
+                "preview_enable": ("BOOLEAN", {"default": False}),
+                "preview_prompt_index": ("INT", {"default": 0, "min": 0, "max": 63}),
+                "preview_seed": ("INT", {"default": 42, "min": 0, "max": 0xffffffffffffffff}),
+                "preview_steps": ("INT", {"default": 20, "min": 1, "max": 100}),
+                "preview_cfg": ("FLOAT", {"default": 7.0, "min": 0.0, "max": 100.0, "step": 0.1}),
+                "preview_sampler": (["euler", "euler_ancestral", "heun", "dpm_2", "dpm_2_ancestral", "lms", "ddim", "ddpm", "deis", "dpm_fast", "dpm_adaptive", "dpmpp_2s_ancestral", "dpmpp_sde", "dpmpp_sde_gpu", "dpmpp_2m", "dpmpp_2m_sde", "dpmpp_2m_sde_gpu", "dpmpp_3m_sde", "dpmpp_3m_sde_gpu", "ipndm", "ipndm_v", "uni_pc", "uni_pc_bh2"], {"default": "euler"}),
+                "preview_scheduler": (["normal", "karras", "exponential", "sgm_uniform", "simple", "ddim_uniform", "beta"], {"default": "normal"}),
+                "preview_width": ("INT", {"default": 512, "min": 16, "max": 4096, "step": 8}),
+                "preview_height": ("INT", {"default": 512, "min": 16, "max": 4096, "step": 8}),
             },
         }
 
-    def run(self, model, clip, model_strength, clip_strength, profile, context, vae=None, output_name="", tagging_options=None, train_options=None):
+    def run(self, model, clip, model_strength, clip_strength, profile, context, vae=None, output_name="", tagging_options=None, train_options=None, preview_enable=False, preview_prompt_index=0, preview_seed=42, preview_steps=20, preview_cfg=7.0, preview_sampler="euler", preview_scheduler="normal", preview_width=512, preview_height=512):
         print(f"[md_soya] === Instant Reference LoRA started ===")
         print(f"[md_soya] profile={profile}, context={'provided' if context else 'None'}, vae={'provided' if vae else 'None'}")
         print(f"[md_soya] model_strength={model_strength}, clip_strength={clip_strength}, output_name={output_name}")
+        print(f"[md_soya] preview_enable={preview_enable}, preview_prompt_index={preview_prompt_index}")
         try:
-            info = _execute_reference_lora(
+            preview_batch, info = _execute_reference_lora(
                 model,
                 clip,
                 profile,
@@ -765,14 +881,24 @@ class InstantReferenceLoRAV1:
                 output_name=output_name,
                 vae=vae,
                 context=context,
+                preview_enable=preview_enable,
+                preview_prompt_index=preview_prompt_index,
+                preview_seed=preview_seed,
+                preview_steps=preview_steps,
+                preview_cfg=preview_cfg,
+                preview_sampler=preview_sampler,
+                preview_scheduler=preview_scheduler,
+                preview_width=preview_width,
+                preview_height=preview_height,
             )
             print(f"[md_soya] === completed ===\n{info}")
-            return (info,)
+            if preview_batch is None:
+                preview_batch = torch.zeros((1, 64, 64, 3), device="cpu")
+            return (preview_batch, info,)
         except Exception as e:
             import traceback
             print(f"[md_soya] === ERROR ===\n{traceback.format_exc()}")
             raise
-
 
 class TaggingOptionsV1:
     CATEGORY = "reference/training"
