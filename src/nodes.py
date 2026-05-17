@@ -58,6 +58,18 @@ def _notify_phase(text: str) -> None:
         pass
 
 
+def _send_ws_progress(phase: str, **kwargs) -> None:
+    """Send structured progress data to all WebSocket clients via ComfyUI PromptServer."""
+    try:
+        from server import PromptServer
+        server = PromptServer.instance
+        if server is not None:
+            data = {"phase": phase, **kwargs}
+            server.send_sync("md_soya_progress", data)
+    except Exception:
+        pass
+
+
 @io.comfytype(io_type="CONTEXT")
 class ContextType(io.ComfyTypeIO):
     Type = dict
@@ -529,6 +541,7 @@ def _run_training(profile: ProfileDefinition, run_dir: Path, output_dir: Path, c
     command.extend([str(training_script), "--config_file", str(config_path)])
 
     pbar = comfy.utils.ProgressBar(total_steps) if total_steps and total_steps > 0 else None
+    t_train_start = time.monotonic()
 
     def on_line(text):
         if pbar is not None:
@@ -538,6 +551,18 @@ def _run_training(profile: ProfileDefinition, run_dir: Path, output_dir: Path, c
                 total = int(match.group(2))
                 pbar.update_absolute(current, total)
                 _notify_phase(f"Training step {current}/{total}")
+                # 구조화된 진행률 WebSocket 전송
+                elapsed = time.monotonic() - t_train_start
+                if current > 0:
+                    avg_s = elapsed / current
+                    remain_s = avg_s * (total - current)
+                    remain_min = remain_s / 60
+                else:
+                    remain_min = 0
+                _send_ws_progress("training",
+                    step=current, total=total,
+                    elapsed_sec=round(elapsed, 1),
+                    remaining_min=round(remain_min, 1))
 
     run_command(command, cwd=paths.sd_scripts, log_path=log_path, line_callback=on_line)
     trained_lora = latest_safetensors(output_dir)
@@ -661,6 +686,7 @@ def _execute_reference_lora(
 
     print("[md_soya] starting training...")
     _notify_phase(f"Training ({target_steps} steps)...")
+    _send_ws_progress("preparing", message=f"Training ({target_steps} steps)...")
     ensure_sd_scripts_environment(paths, log_path=run_log)
     builtins = _builtins_for_run(dataset_dir, output_dir, output_name)
     config_path = _write_resolved_config(selected_profile, resolved_slots, builtins, run_dir, resolved_train)
@@ -695,6 +721,7 @@ def _execute_reference_lora(
     trained_lora = _run_training(selected_profile, run_dir, output_dir, config_path, log_path=run_log, total_steps=target_steps)
     print(f"[md_soya] training done, lora={trained_lora}")
     _notify_phase("Training complete!")
+    _send_ws_progress("training_complete", message="Training complete!", lora_path=str(trained_lora))
 
     # --- Post-hoc preview: sample all checkpoints after training ---
     preview_images = []
@@ -709,6 +736,7 @@ def _execute_reference_lora(
             total_previews = len(checkpoints) * num_prompts_per_ckpt
             print(f"[md_soya] Post-hoc preview: found {len(checkpoints)} checkpoints, {num_prompts_per_ckpt} prompts each = {total_previews} total")
             _notify_phase(f"Preview 0/{total_previews}...")
+            _send_ws_progress("preview_start", total=total_previews)
             t_preview_start = time.monotonic()
             for ckpt in checkpoints:
                 print(f"[md_soya] Sampling preview for {ckpt.name}...")
@@ -745,6 +773,10 @@ def _execute_reference_lora(
                             remain_s = avg_s * (total_previews - done)
                             remain_m = remain_s / 60
                             _notify_phase(f"Preview {done}/{total_previews} (~{remain_m:.1f}min left)")
+                            _send_ws_progress("preview",
+                                current=done, total=total_previews,
+                                remaining_min=round(remain_m, 1),
+                                checkpoint=ckpt.name)
                             print(f"[md_soya] Preview done for {ckpt.name} [{pi+1}/{len(parsed_pos)}] ({done}/{total_previews}): {img.shape}")
                     else:
                         # Legacy single-prompt mode
@@ -767,6 +799,10 @@ def _execute_reference_lora(
                         remain_s = avg_s * (total_previews - done)
                         remain_m = remain_s / 60
                         _notify_phase(f"Preview {done}/{total_previews} (~{remain_m:.1f}min left)")
+                        _send_ws_progress("preview",
+                            current=done, total=total_previews,
+                            remaining_min=round(remain_m, 1),
+                            checkpoint=ckpt.name)
                         print(f"[md_soya] Preview done for {ckpt.name} ({done}/{total_previews}): {img.shape}")
                 except Exception as exc:
                     print(f"[md_soya] Preview failed for {ckpt.name}: {exc}")
@@ -776,6 +812,9 @@ def _execute_reference_lora(
                     comfy.model_management.unload_all_models()
         except Exception as exc:
             print(f"[md_soya] Post-hoc preview error: {exc}")
+
+    # 전체 완료
+    _send_ws_progress("all_complete", message="All done!", lora_path=str(trained_lora))
 
     # --- Save preview JPGs, config TOML, and JSON mapping for each checkpoint ---
     import gc
