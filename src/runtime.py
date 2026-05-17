@@ -293,7 +293,7 @@ def get_runtime_paths() -> RuntimePaths:
     lora_dirs = folder_paths.get_folder_paths("loras")
     if not lora_dirs:
         raise RuntimeError("No ComfyUI LoRA directories are registered.")
-    generated_loras = ensure_dir(Path(lora_dirs[0]) / "Anima")
+    generated_loras = ensure_dir(Path(lora_dirs[0]) / "SOYA_CHAR_LORA")
     return RuntimePaths(
         root=root,
         sd_scripts=root / "sd-scripts",

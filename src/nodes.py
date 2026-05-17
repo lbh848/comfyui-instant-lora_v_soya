@@ -4,9 +4,11 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import shutil
 import tempfile
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -101,7 +103,6 @@ class TrainOptions:
     save_every_n_steps: int = 0
     seed_override: int = -1
     force_retrain: bool = False
-    output_name_override: str = ""
 
 
 def _plugin_root() -> Path:
@@ -156,7 +157,6 @@ def _train_options_from_input(value: Any | None) -> TrainOptions:
         save_every_n_steps=int(value.get("save_every_n_steps", 0)),
         seed_override=int(value.get("seed_override", -1)),
         force_retrain=bool(value.get("force_retrain", False)),
-        output_name_override=str(value.get("output_name", "")),
     )
 
 
@@ -558,7 +558,7 @@ def _execute_reference_lora(
     model, clip, profile,
     model_strength=1.0, clip_strength=1.0,
     tagging_options=None, train_options=None,
-    output_name="", vae=None, context=None,
+    save_path="", vae=None, context=None,
     preview_enable=False, preview_prompt_index=0, preview_seed=42,
     preview_steps=20, preview_cfg=7.0, preview_sampler="euler", preview_scheduler="normal",
     preview_width=512, preview_height=512,
@@ -649,24 +649,16 @@ def _execute_reference_lora(
     run_log = run_dir / "run.log"
     if temp_run_log != run_log:
         _merge_run_log(temp_run_log, run_log)
-    output_dir = ensure_dir(paths.outputs / cache_key)
-    final_output_name = output_name.strip()
-    if not final_output_name:
-        final_output_name = resolved_train.output_name_override.strip()
-    if not final_output_name:
-        final_output_name = f"instant_{cache_key[:12]}"
-    output_name = final_output_name
+    save_path_clean = save_path.strip().strip("/\\")
+    if not save_path_clean:
+        raise RuntimeError("save_path is required. Enter a path like 'hamin/anima-01'.")
+    date_folder = datetime.now().strftime("%Y%m%d-%H%M%S")
+    output_dir = ensure_dir(paths.outputs / save_path_clean / date_folder)
+    output_name = secrets.token_hex(4)
     manifest = run_dir / "manifest.json"
 
     print("[md_soya] starting training...")
     _notify_phase(f"Training ({target_steps} steps)...")
-    # Clear previous output artifacts before training
-    for old_ckpt in output_dir.glob("*.safetensors"):
-        try:
-            old_ckpt.unlink()
-            print(f"[md_soya] removed old checkpoint: {old_ckpt.name}")
-        except OSError:
-            pass
     ensure_sd_scripts_environment(paths, log_path=run_log)
     builtins = _builtins_for_run(dataset_dir, output_dir, output_name)
     config_path = _write_resolved_config(selected_profile, resolved_slots, builtins, run_dir, resolved_train)
@@ -702,13 +694,9 @@ def _execute_reference_lora(
     print(f"[md_soya] training done, lora={trained_lora}")
     _notify_phase("Training complete!")
 
-    _record_last_lora(trained_lora)
-    info = f"[trained] {trained_lora.name} -> {trained_lora}"
-    if all_tags_text:
-        info += f"\ntags: {all_tags_text}"
-
     # --- Post-hoc preview: sample all checkpoints after training ---
     preview_images = []
+    preview_map: dict[Path, Any] = {}
     if preview_enable and vae is not None:
         try:
             checkpoints = sorted(output_dir.glob("*.safetensors"), key=lambda p: p.stat().st_mtime)
@@ -741,6 +729,7 @@ def _execute_reference_lora(
                         preview_sampler, preview_scheduler,
                     )
                     preview_images.append(img)
+                    preview_map[ckpt] = img
                     print(f"[md_soya] Preview done for {ckpt.name}: {img.shape}")
                 except Exception as exc:
                     print(f"[md_soya] Preview failed for {ckpt.name}: {exc}")
@@ -750,6 +739,27 @@ def _execute_reference_lora(
                     comfy.model_management.unload_all_models()
         except Exception as exc:
             print(f"[md_soya] Post-hoc preview error: {exc}")
+
+    # --- Save preview JPG and config TOML for each checkpoint ---
+    import gc
+    gc.collect()
+    from PIL import Image as PILImage
+
+    for ckpt_path in sorted(output_dir.glob("*.safetensors"), key=lambda p: p.stat().st_mtime):
+        base = ckpt_path.stem  # e.g. "b4bd9ced_00000050" or "b4bd9ced"
+
+        if ckpt_path in preview_map:
+            img_tensor = preview_map[ckpt_path]
+            img_np = (img_tensor[0].cpu().numpy() * 255).astype("uint8")
+            PILImage.fromarray(img_np).save(str(output_dir / f"{base}.jpg"))
+
+        shutil.copy2(config_path, output_dir / f"{base}.toml")
+
+    _record_last_lora(trained_lora)
+
+    info = f"[trained] {trained_lora.name} -> {trained_lora}"
+    if all_tags_text:
+        info += f"\ntags: {all_tags_text}"
 
     if preview_images:
         preview_batch = torch.cat(preview_images, dim=0)
@@ -790,7 +800,7 @@ class MdSoyaInstantReferenceLoRA(io.ComfyNode):
                 io.String.Input("profile", default=profile_keys[0] if profile_keys else ""),
                 ContextType.Input("context"),
                 io.Vae.Input("vae", optional=True),
-                io.String.Input("output_name", default=""),
+                io.String.Input("save_path", default=""),
                 TaggingOptionsType.Input("tagging_options", optional=True),
                 TrainOptionsType.Input("train_options", optional=True),
                 io.Boolean.Input("preview_enable", default=False),
@@ -815,7 +825,7 @@ class MdSoyaInstantReferenceLoRA(io.ComfyNode):
         return profiles_fingerprint(profiles)
 
     @classmethod
-    def execute(cls, model, clip, model_strength=1.0, clip_strength=1.0, profile="", tagging_options=None, train_options=None, output_name="", vae=None, context=None, preview_enable=False, preview_prompt_index=0, preview_seed=42, preview_steps=20, preview_cfg=7.0, preview_sampler="euler", preview_scheduler="normal", preview_width=512, preview_height=512) -> io.NodeOutput:
+    def execute(cls, model, clip, model_strength=1.0, clip_strength=1.0, profile="", tagging_options=None, train_options=None, save_path="", vae=None, context=None, preview_enable=False, preview_prompt_index=0, preview_seed=42, preview_steps=20, preview_cfg=7.0, preview_sampler="euler", preview_scheduler="normal", preview_width=512, preview_height=512) -> io.NodeOutput:
         info, preview_batch = _execute_reference_lora(
             model,
             clip,
@@ -824,7 +834,7 @@ class MdSoyaInstantReferenceLoRA(io.ComfyNode):
             clip_strength=clip_strength,
             tagging_options=tagging_options,
             train_options=train_options,
-            output_name=output_name,
+            save_path=save_path,
             vae=vae,
             context=context,
             preview_enable=preview_enable,
@@ -864,7 +874,7 @@ class InstantReferenceLoRAV1:
             },
             "optional": {
                 "vae": ("VAE",),
-                "output_name": ("STRING", {"default": "", "multiline": False}),
+                "save_path": ("STRING", {"default": "", "multiline": False}),
                 "tagging_options": ("TAGGING_OPTIONS",),
                 "train_options": ("TRAIN_OPTIONS",),
                 "preview_enable": ("BOOLEAN", {"default": False}),
@@ -879,10 +889,10 @@ class InstantReferenceLoRAV1:
             },
         }
 
-    def run(self, model, clip, model_strength, clip_strength, profile, context, vae=None, output_name="", tagging_options=None, train_options=None, preview_enable=False, preview_prompt_index=0, preview_seed=42, preview_steps=20, preview_cfg=7.0, preview_sampler="euler", preview_scheduler="normal", preview_width=512, preview_height=512):
+    def run(self, model, clip, model_strength, clip_strength, profile, context, vae=None, save_path="", tagging_options=None, train_options=None, preview_enable=False, preview_prompt_index=0, preview_seed=42, preview_steps=20, preview_cfg=7.0, preview_sampler="euler", preview_scheduler="normal", preview_width=512, preview_height=512):
         print(f"[md_soya] === Instant Reference LoRA started ===")
         print(f"[md_soya] profile={profile}, context={'provided' if context else 'None'}, vae={'provided' if vae else 'None'}")
-        print(f"[md_soya] model_strength={model_strength}, clip_strength={clip_strength}, output_name={output_name}")
+        print(f"[md_soya] model_strength={model_strength}, clip_strength={clip_strength}, save_path={save_path}")
         print(f"[md_soya] preview_enable={preview_enable}, preview_prompt_index={preview_prompt_index}")
         try:
             info, preview_batch = _execute_reference_lora(
@@ -893,7 +903,7 @@ class InstantReferenceLoRAV1:
                 clip_strength=clip_strength,
                 tagging_options=tagging_options,
                 train_options=train_options,
-                output_name=output_name,
+                save_path=save_path,
                 vae=vae,
                 context=context,
                 preview_enable=preview_enable,
@@ -954,7 +964,6 @@ class TrainOptionsV1:
                 "network_dim_override": ("INT", {"default": 0, "min": 0, "max": 1024}),
                 "network_alpha_override": ("INT", {"default": 0, "min": 0, "max": 1024}),
                 "resolution_override": ("STRING", {"default": "", "multiline": False}),
-                "output_name": ("STRING", {"default": "", "multiline": False}),
                 "gradient_checkpointing": ("BOOLEAN", {"default": True}),
                 "cache_latents": ("BOOLEAN", {"default": True}),
                 "cache_text_encoder_outputs": ("BOOLEAN", {"default": True}),
