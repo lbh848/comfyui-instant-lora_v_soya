@@ -590,8 +590,13 @@ def _execute_reference_lora(
     preview_width=512, preview_height=512,
     preview_positive_prompt="", preview_negative_prompt="",
     preview_no_lora=False,
+    preview_model=None, preview_clip=None, preview_vae=None,
 ) -> tuple:
     print("[md_soya] _execute_reference_lora called")
+    # Fallback: use training model/clip/vae for preview if separate preview inputs not provided
+    pv_model = preview_model if preview_model is not None else model
+    pv_clip = preview_clip if preview_clip is not None else clip
+    pv_vae = preview_vae if preview_vae is not None else vae
     # Support both string (profile key) and dict (legacy combo format)
     if isinstance(profile, str):
         profile_key = profile
@@ -730,7 +735,7 @@ def _execute_reference_lora(
     parsed_pos = _parse_prompt_groups(preview_positive_prompt) if preview_positive_prompt else []
     parsed_neg = _parse_prompt_groups(preview_negative_prompt) if preview_negative_prompt else []
 
-    if preview_enable and vae is not None:
+    if preview_enable and pv_vae is not None:
         try:
             checkpoints = sorted(output_dir.glob("*.safetensors"), key=lambda p: p.stat().st_mtime)
             num_prompts_per_ckpt = len(parsed_pos) if parsed_pos else 1
@@ -747,7 +752,7 @@ def _execute_reference_lora(
                         soft_empty_cache()
 
                     m_patched, c_patched = patch_lora_onto_models(
-                        model, clip, str(ckpt), model_strength, clip_strength
+                        pv_model, pv_clip, str(ckpt), model_strength, clip_strength
                     )
 
                     w = preview_width if preview_width > 0 else (context["images"].shape[2] if "images" in context else 512)
@@ -759,7 +764,7 @@ def _execute_reference_lora(
                         for pi, pos_text in enumerate(parsed_pos):
                             neg_text = parsed_neg[pi] if pi < len(parsed_neg) else (parsed_neg[-1] if parsed_neg else "")
                             img = generate_preview(
-                                m_patched, c_patched, vae,
+                                m_patched, c_patched, pv_vae,
                                 pos_text, neg_text,
                                 w, h,
                                 preview_seed + len(preview_images),
@@ -785,7 +790,7 @@ def _execute_reference_lora(
                         idx = min(preview_prompt_index, len(entries) - 1) if entries else 0
                         entry = entries[idx] if entries else {"positive_tags": "", "negative_tags": ""}
                         img = generate_preview(
-                            m_patched, c_patched, vae,
+                            m_patched, c_patched, pv_vae,
                             entry.get("positive_tags", ""), entry.get("negative_tags", ""),
                             w, h,
                             preview_seed + len(preview_images),
@@ -814,9 +819,9 @@ def _execute_reference_lora(
         except Exception as exc:
             print(f"[md_soya] Post-hoc preview error: {exc}")
 
-    # --- No-LoRA comparison previews (unpatched model/clip) ---
+    # --- No-LoRA comparison previews (unpatched preview model/clip) ---
     no_lora_images = []  # [(prompt_index, img_tensor), ...]
-    if preview_no_lora and preview_enable and vae is not None:
+    if preview_no_lora and preview_enable and pv_vae is not None:
         try:
             comfy.model_management.unload_all_models()
             if callable(soft_empty_cache):
@@ -829,7 +834,7 @@ def _execute_reference_lora(
                 for pi, pos_text in enumerate(parsed_pos):
                     neg_text = parsed_neg[pi] if pi < len(parsed_neg) else (parsed_neg[-1] if parsed_neg else "")
                     img = generate_preview(
-                        model, clip, vae,
+                        pv_model, pv_clip, pv_vae,
                         pos_text, neg_text,
                         w, h,
                         preview_seed + len(preview_images),
@@ -844,7 +849,7 @@ def _execute_reference_lora(
                 idx = min(preview_prompt_index, len(entries) - 1) if entries else 0
                 entry = entries[idx] if entries else {"positive_tags": "", "negative_tags": ""}
                 img = generate_preview(
-                    model, clip, vae,
+                    pv_model, pv_clip, pv_vae,
                     entry.get("positive_tags", ""), entry.get("negative_tags", ""),
                     w, h,
                     preview_seed + len(preview_images),
@@ -971,6 +976,9 @@ class MdSoyaInstantReferenceLoRA(io.ComfyNode):
                 io.String.Input("preview_positive_prompt", default="", multiline=True),
                 io.String.Input("preview_negative_prompt", default="", multiline=True),
                 io.Boolean.Input("preview_no_lora", default=False),
+                io.Model.Input("preview_model", optional=True),
+                io.Clip.Input("preview_clip", optional=True),
+                io.Vae.Input("preview_vae", optional=True),
             ],
             outputs=[
                 io.String.Output(display_name="info"),
@@ -984,7 +992,7 @@ class MdSoyaInstantReferenceLoRA(io.ComfyNode):
         return profiles_fingerprint(profiles)
 
     @classmethod
-    def execute(cls, model, clip, model_strength=1.0, clip_strength=1.0, profile="", tagging_options=None, train_options=None, save_path="", vae=None, context=None, preview_enable=False, preview_prompt_index=0, preview_seed=42, preview_steps=20, preview_cfg=7.0, preview_sampler="euler", preview_scheduler="normal", preview_width=512, preview_height=512, preview_positive_prompt="", preview_negative_prompt="") -> io.NodeOutput:
+    def execute(cls, model, clip, model_strength=1.0, clip_strength=1.0, profile="", tagging_options=None, train_options=None, save_path="", vae=None, context=None, preview_enable=False, preview_prompt_index=0, preview_seed=42, preview_steps=20, preview_cfg=7.0, preview_sampler="euler", preview_scheduler="normal", preview_width=512, preview_height=512, preview_positive_prompt="", preview_negative_prompt="", preview_model=None, preview_clip=None, preview_vae=None) -> io.NodeOutput:
         info, preview_batch = _execute_reference_lora(
             model,
             clip,
@@ -1007,6 +1015,9 @@ class MdSoyaInstantReferenceLoRA(io.ComfyNode):
             preview_height=preview_height,
             preview_positive_prompt=preview_positive_prompt,
             preview_negative_prompt=preview_negative_prompt,
+            preview_model=preview_model,
+            preview_clip=preview_clip,
+            preview_vae=preview_vae,
         )
         return io.NodeOutput(info, preview_batch)
 class ReferenceTrainingExtension(ComfyExtension):
@@ -1050,10 +1061,13 @@ class InstantReferenceLoRAV1:
                 "preview_positive_prompt": ("STRING", {"default": "", "multiline": True}),
                 "preview_negative_prompt": ("STRING", {"default": "", "multiline": True}),
                 "preview_no_lora": ("BOOLEAN", {"default": False}),
+                "preview_model": ("MODEL",),
+                "preview_clip": ("CLIP",),
+                "preview_vae": ("VAE",),
             },
         }
 
-    def run(self, model, clip, model_strength, clip_strength, profile, context, vae=None, save_path="", tagging_options=None, train_options=None, preview_enable=False, preview_prompt_index=0, preview_seed=42, preview_steps=20, preview_cfg=7.0, preview_sampler="euler", preview_scheduler="normal", preview_width=512, preview_height=512, preview_positive_prompt="", preview_negative_prompt="", preview_no_lora=False):
+    def run(self, model, clip, model_strength, clip_strength, profile, context, vae=None, save_path="", tagging_options=None, train_options=None, preview_enable=False, preview_prompt_index=0, preview_seed=42, preview_steps=20, preview_cfg=7.0, preview_sampler="euler", preview_scheduler="normal", preview_width=512, preview_height=512, preview_positive_prompt="", preview_negative_prompt="", preview_no_lora=False, preview_model=None, preview_clip=None, preview_vae=None):
         print(f"[md_soya] === Instant Reference LoRA started ===")
         print(f"[md_soya] profile={profile}, context={'provided' if context else 'None'}, vae={'provided' if vae else 'None'}")
         print(f"[md_soya] model_strength={model_strength}, clip_strength={clip_strength}, save_path={save_path}")
@@ -1082,6 +1096,9 @@ class InstantReferenceLoRAV1:
                 preview_positive_prompt=preview_positive_prompt,
                 preview_negative_prompt=preview_negative_prompt,
                 preview_no_lora=preview_no_lora,
+                preview_model=preview_model,
+                preview_clip=preview_clip,
+                preview_vae=preview_vae,
             )
             print(f"[md_soya] === completed ===\n{info}")
             if preview_batch is None:
