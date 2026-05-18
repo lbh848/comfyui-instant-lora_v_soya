@@ -10,7 +10,9 @@ import comfy.utils
 def patch_lora_onto_models(model, clip, lora_path: str, strength_model: float, strength_clip: float):
     """동적으로 LoRA를 패치하고 (patched_model, patched_clip) 튜플을 반환한다."""
     lora_sd = comfy.utils.load_torch_file(lora_path, safe_load=True)
-    return comfy.sd.load_lora_for_models(model, clip, lora_sd, strength_model, strength_clip)
+    m, c = comfy.sd.load_lora_for_models(model, clip, lora_sd, strength_model, strength_clip)
+    del lora_sd
+    return m, c
 
 
 def encode_conditioning(clip, text: str):
