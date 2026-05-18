@@ -867,17 +867,7 @@ def _execute_reference_lora(
     gc.collect()
     from PIL import Image as PILImage
 
-    # Save no-LoRA comparison images first
     no_lora_filenames = []
-    for pidx, img_tensor in no_lora_images:
-        if pidx > 0:
-            jpg_name = f"no_lora-{pidx}.jpg"
-        else:
-            jpg_name = "no_lora.jpg"
-        img_np = (img_tensor[0].cpu().numpy() * 255).astype("uint8")
-        PILImage.fromarray(img_np).save(str(output_dir / jpg_name))
-        no_lora_filenames.append(jpg_name)
-
     for ckpt_path in sorted(output_dir.glob("*.safetensors"), key=lambda p: p.stat().st_mtime):
         base = ckpt_path.stem  # e.g. "7cfdab8d" or "7cfdab8d-step00000025"
 
@@ -894,14 +884,32 @@ def _execute_reference_lora(
 
         shutil.copy2(config_path, output_dir / f"{base}.toml")
 
-        ckpt_json = {
-            "lora_file": ckpt_path.name,
-            "config_file": f"{base}.toml",
-            "previews": preview_filenames,
-        }
-        if no_lora_filenames:
-            ckpt_json["no_lora_previews"] = no_lora_filenames
-        write_json(output_dir / f"{base}.json", ckpt_json)
+        write_json(
+            output_dir / f"{base}.json",
+            {
+                "lora_file": ckpt_path.name,
+                "config_file": f"{base}.toml",
+                "previews": preview_filenames,
+            },
+        )
+
+    # Save no-LoRA comparison images using trained_lora's base name, appended after existing preview indices
+    if no_lora_images and trained_lora is not None:
+        final_base = trained_lora.stem
+        # Reload final checkpoint JSON to append
+        final_json_path = output_dir / f"{final_base}.json"
+        final_json = json.loads(final_json_path.read_text(encoding="utf-8")) if final_json_path.exists() else {}
+        final_preview_filenames = final_json.get("previews", [])
+        next_idx = len(final_preview_filenames) + 1
+        for pidx, img_tensor in no_lora_images:
+            jpg_name = f"{final_base}-{next_idx}.jpg"
+            img_np = (img_tensor[0].cpu().numpy() * 255).astype("uint8")
+            PILImage.fromarray(img_np).save(str(output_dir / jpg_name))
+            no_lora_filenames.append(jpg_name)
+            final_preview_filenames.append(jpg_name)
+            next_idx += 1
+        final_json["previews"] = final_preview_filenames
+        write_json(final_json_path, final_json)
 
     _record_last_lora(trained_lora)
 
