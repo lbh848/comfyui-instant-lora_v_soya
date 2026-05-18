@@ -113,6 +113,8 @@ class TrainOptions:
     gradient_checkpointing: bool = True
     cache_latents: bool = True
     cache_text_encoder_outputs: bool = True
+    train_text_encoder: bool = False
+    text_encoder_lr: float = 0.0
     save_every_n_steps: int = 0
     seed_override: int = -1
     force_retrain: bool = False
@@ -479,7 +481,14 @@ def _apply_train_options(config_text: str, options: TrainOptions) -> str:
         overrides["resolution"] = options.resolution_override.strip()
     overrides["gradient_checkpointing"] = options.gradient_checkpointing
     overrides["cache_latents"] = options.cache_latents
-    overrides["cache_text_encoder_outputs"] = options.cache_text_encoder_outputs
+    if options.train_text_encoder:
+        # Remove network_train_unet_only so TE is also trained
+        config_text = re.sub(r"(?m)^network_train_unet_only\s*=.*\n?", "", config_text)
+        overrides["cache_text_encoder_outputs"] = False
+        if options.text_encoder_lr > 0:
+            overrides["text_encoder_lr"] = options.text_encoder_lr
+    else:
+        overrides["cache_text_encoder_outputs"] = options.cache_text_encoder_outputs
     if options.save_every_n_steps > 0:
         overrides["save_every_n_steps"] = options.save_every_n_steps
     if os.name == "nt":
@@ -1151,6 +1160,8 @@ class TrainOptionsV1:
                 "gradient_checkpointing": ("BOOLEAN", {"default": True}),
                 "cache_latents": ("BOOLEAN", {"default": True}),
                 "cache_text_encoder_outputs": ("BOOLEAN", {"default": True}),
+                "train_text_encoder": ("BOOLEAN", {"default": False}),
+                "text_encoder_lr": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.0001}),
                 "save_every_n_steps": ("INT", {"default": 0, "min": 0, "max": 100000}),
                 "seed_override": ("INT", {"default": -1, "min": -1, "max": 2**31 - 1}),
                 "force_retrain": ("BOOLEAN", {"default": False}),
