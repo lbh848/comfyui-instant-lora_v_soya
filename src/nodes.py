@@ -118,6 +118,7 @@ class TrainOptions:
     save_every_n_steps: int = 0
     seed_override: int = -1
     force_retrain: bool = False
+    block_weight: str = ""
 
 
 def _plugin_root() -> Path:
@@ -172,6 +173,7 @@ def _train_options_from_input(value: Any | None) -> TrainOptions:
         save_every_n_steps=int(value.get("save_every_n_steps", 0)),
         seed_override=int(value.get("seed_override", -1)),
         force_retrain=bool(value.get("force_retrain", False)),
+        block_weight=str(value.get("block_weight", "")),
     )
 
 
@@ -180,7 +182,8 @@ def _tagging_options_fingerprint(options: TaggingOptions) -> str:
 
 
 def _train_options_fingerprint(options: TrainOptions) -> str:
-    return _hash_options(options.__dict__)
+    d = {k: v for k, v in options.__dict__.items() if k != "block_weight"}
+    return _hash_options(d)
 
 
 def _effective_max_train_steps(profile: ProfileDefinition, options: TrainOptions) -> int:
@@ -761,7 +764,8 @@ def _execute_reference_lora(
                         soft_empty_cache()
 
                     m_patched, c_patched = patch_lora_onto_models(
-                        pv_model, pv_clip, str(ckpt), model_strength, clip_strength
+                        pv_model, pv_clip, str(ckpt), model_strength, clip_strength,
+                        block_weight=resolved_train.block_weight,
                     )
 
                     w = preview_width if preview_width > 0 else (context["images"].shape[2] if "images" in context else 512)
@@ -1165,6 +1169,11 @@ class TrainOptionsV1:
                 "save_every_n_steps": ("INT", {"default": 0, "min": 0, "max": 100000}),
                 "seed_override": ("INT", {"default": -1, "min": -1, "max": 2**31 - 1}),
                 "force_retrain": ("BOOLEAN", {"default": False}),
+                "block_weight": ("STRING", {
+                    "default": "",
+                    "multiline": False,
+                    "tooltip": "LoRA Block Weight for SDXL. Format: comma-separated floats (e.g. '1,1,1,1,1,1,1,1,1,1,0,1,1,1,1,1,1,1,1,1,1'). Empty = all blocks enabled (default behavior). Only applies to SDXL profile."
+                }),
             }
         }
 
