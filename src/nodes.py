@@ -116,6 +116,7 @@ class TrainOptions:
     train_text_encoder: bool = False
     text_encoder_lr: float = 0.0
     save_every_n_steps: int = 0
+    keep_from_step: int = 0
     seed_override: int = -1
     force_retrain: bool = False
     block_weight: str = ""
@@ -171,6 +172,7 @@ def _train_options_from_input(value: Any | None) -> TrainOptions:
         cache_latents=bool(value.get("cache_latents", True)),
         cache_text_encoder_outputs=bool(value.get("cache_text_encoder_outputs", True)),
         save_every_n_steps=int(value.get("save_every_n_steps", 0)),
+        keep_from_step=int(value.get("keep_from_step", 0)),
         seed_override=int(value.get("seed_override", -1)),
         force_retrain=bool(value.get("force_retrain", False)),
         block_weight=str(value.get("block_weight", "")),
@@ -741,6 +743,17 @@ def _execute_reference_lora(
     _notify_phase("Training complete!")
     _send_ws_progress("training_complete", message="Training complete!", lora_path=str(trained_lora))
 
+    # --- Keep-from-step: delete intermediate checkpoints before threshold ---
+    if resolved_train.keep_from_step > 0:
+        import re as _re
+        _step_pattern = _re.compile(r"-step0*(\d+)\.")
+        for ckpt in list(output_dir.glob("*.safetensors")):
+            # Never delete the final checkpoint (no step suffix = last step)
+            m = _step_pattern.search(ckpt.name)
+            if m and int(m.group(1)) < resolved_train.keep_from_step:
+                ckpt.unlink()
+                print(f"[md_soya] keep_from_step: deleted {ckpt.name}")
+
     # --- Post-hoc preview: sample all checkpoints after training ---
     preview_images = []
     preview_map: dict[Path, list] = {}  # ckpt_path -> [(prompt_index, img_tensor), ...]
@@ -1167,6 +1180,7 @@ class TrainOptionsV1:
                 "train_text_encoder": ("BOOLEAN", {"default": False}),
                 "text_encoder_lr": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.0001}),
                 "save_every_n_steps": ("INT", {"default": 0, "min": 0, "max": 100000}),
+                "keep_from_step": ("INT", {"default": 0, "min": 0, "max": 100000, "tooltip": "Delete intermediate checkpoints before this step. 0 = keep all."}),
                 "seed_override": ("INT", {"default": -1, "min": -1, "max": 2**31 - 1}),
                 "force_retrain": ("BOOLEAN", {"default": False}),
                 "block_weight": ("STRING", {
