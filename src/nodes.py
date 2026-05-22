@@ -43,6 +43,7 @@ NODE_VERSION = "0.1.4"
 MAX_TRAIN_STEPS_PATTERN = re.compile(r"^\s*max_train_steps\s*=\s*(\d+)\s*$", re.MULTILINE)
 MIXED_PRECISION_PATTERN = re.compile(r'^\s*mixed_precision\s*=\s*"([^"]+)"\s*$', re.MULTILINE)
 _TRAIN_STEP_RE = re.compile(r'\|\s*(\d+)/(\d+)\s')
+_TRAIN_LOSS_RE = re.compile(r'avr_loss[=:]\s*([0-9]*\.?[0-9]+)')
 
 
 def _notify_phase(text: str) -> None:
@@ -534,7 +535,7 @@ def _write_resolved_config(
     return config_path
 
 
-def _run_training(profile: ProfileDefinition, run_dir: Path, output_dir: Path, config_path: Path, log_path: Path, total_steps: int | None = None) -> Path:
+def _run_training(profile: ProfileDefinition, run_dir: Path, output_dir: Path, config_path: Path, log_path: Path, total_steps: int | None = None) -> tuple[Path, dict[int, float]]:
     paths = get_runtime_paths()
     ensure_sd_scripts_environment(paths, log_path=log_path)
     python_path = venv_python(paths.venv)
@@ -556,13 +557,21 @@ def _run_training(profile: ProfileDefinition, run_dir: Path, output_dir: Path, c
 
     pbar = comfy.utils.ProgressBar(total_steps) if total_steps and total_steps > 0 else None
     t_train_start = time.monotonic()
+    loss_history: dict[int, float] = {}
+    current_step = [0]
 
     def on_line(text):
+        loss_match = _TRAIN_LOSS_RE.search(text)
+        if loss_match:
+            step = current_step[0]
+            if step > 0:
+                loss_history[step] = float(loss_match.group(1))
         if pbar is not None:
             match = _TRAIN_STEP_RE.search(text)
             if match:
                 current = int(match.group(1))
                 total = int(match.group(2))
+                current_step[0] = current
                 pbar.update_absolute(current, total)
                 _notify_phase(f"Training step {current}/{total}")
                 # 구조화된 진행률 WebSocket 전송
@@ -573,16 +582,20 @@ def _run_training(profile: ProfileDefinition, run_dir: Path, output_dir: Path, c
                     remain_min = remain_s / 60
                 else:
                     remain_min = 0
-                _send_ws_progress("training",
+                ws_data = dict(
                     step=current, total=total,
                     elapsed_sec=round(elapsed, 1),
-                    remaining_min=round(remain_min, 1))
+                    remaining_min=round(remain_min, 1),
+                )
+                if current in loss_history:
+                    ws_data["avr_loss"] = round(loss_history[current], 6)
+                _send_ws_progress("training", **ws_data)
 
     run_command(command, cwd=paths.sd_scripts, log_path=log_path, line_callback=on_line)
     trained_lora = latest_safetensors(output_dir)
     if trained_lora is None:
         raise RuntimeError(f"Training completed but no LoRA file was found in {output_dir}")
-    return trained_lora
+    return trained_lora, loss_history
 
 
 def _record_last_lora(lora_path: Path) -> None:
@@ -738,8 +751,8 @@ def _execute_reference_lora(
     if callable(soft_empty_cache):
         soft_empty_cache()
     print("[md_soya] calling _run_training...")
-    trained_lora = _run_training(selected_profile, run_dir, output_dir, config_path, log_path=run_log, total_steps=target_steps)
-    print(f"[md_soya] training done, lora={trained_lora}")
+    trained_lora, loss_history = _run_training(selected_profile, run_dir, output_dir, config_path, log_path=run_log, total_steps=target_steps)
+    print(f"[md_soya] training done, lora={trained_lora}, loss_history={len(loss_history)} entries")
     _notify_phase("Training complete!")
     _send_ws_progress("training_complete", message="Training complete!", lora_path=str(trained_lora))
 
@@ -899,6 +912,8 @@ def _execute_reference_lora(
     from PIL import Image as PILImage
 
     no_lora_filenames = []
+    # Extract step number from checkpoint filename (e.g. "7cfdab8d-step00000025" -> 25)
+    _ckpt_step_re = re.compile(r"-step0*(\d+)")
     for ckpt_path in sorted(output_dir.glob("*.safetensors"), key=lambda p: p.stat().st_mtime):
         base = ckpt_path.stem  # e.g. "7cfdab8d" or "7cfdab8d-step00000025"
 
@@ -915,14 +930,23 @@ def _execute_reference_lora(
 
         shutil.copy2(config_path, output_dir / f"{base}.toml")
 
-        write_json(
-            output_dir / f"{base}.json",
-            {
-                "lora_file": ckpt_path.name,
-                "config_file": f"{base}.toml",
-                "previews": preview_filenames,
-            },
-        )
+        json_data = {
+            "lora_file": ckpt_path.name,
+            "config_file": f"{base}.toml",
+            "previews": preview_filenames,
+        }
+        # Find the closest step's avr_loss for this checkpoint
+        step_match = _ckpt_step_re.search(ckpt_path.name)
+        if step_match:
+            ckpt_step = int(step_match.group(1))
+            if ckpt_step in loss_history:
+                json_data["avr_loss"] = loss_history[ckpt_step]
+        elif loss_history:
+            # Final checkpoint (no step suffix) — use the last recorded loss
+            last_step = max(loss_history)
+            json_data["avr_loss"] = loss_history[last_step]
+
+        write_json(output_dir / f"{base}.json", json_data)
 
     # Save no-LoRA comparison images using trained_lora's base name, appended after existing preview indices
     if no_lora_images and trained_lora is not None:
