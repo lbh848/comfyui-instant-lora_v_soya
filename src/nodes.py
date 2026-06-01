@@ -739,12 +739,21 @@ def _execute_reference_lora(
         },
     )
     # --- preview auto-save_every_n_steps injection ---
-    if preview_enable and resolved_train.save_every_n_steps <= 0:
+    _use_instance_image = (
+        preview_positive_prompt.strip() == "instance"
+        and preview_negative_prompt.strip() == "instance"
+    )
+    if preview_enable and not _use_instance_image and resolved_train.save_every_n_steps <= 0:
         auto_save_every = max(1, target_steps // 4)
         config_text = config_path.read_text(encoding="utf-8")
         config_text = _set_toml_key(config_text, "save_every_n_steps", auto_save_every)
         config_path.write_text(config_text, encoding="utf-8")
         print(f"[md_soya] preview enabled, auto save_every_n_steps={auto_save_every}")
+    elif preview_enable and _use_instance_image:
+        config_text = config_path.read_text(encoding="utf-8")
+        config_text = _set_toml_key(config_text, "save_every_n_steps", 0)
+        config_path.write_text(config_text, encoding="utf-8")
+        print(f"[md_soya] instance mode: skipping intermediate saves, final checkpoint only")
 
     comfy.model_management.unload_all_models()
     soft_empty_cache = getattr(comfy.model_management, "soft_empty_cache", None)
@@ -770,48 +779,85 @@ def _execute_reference_lora(
     # --- Post-hoc preview: sample all checkpoints after training ---
     preview_images = []
     preview_map: dict[Path, list] = {}  # ckpt_path -> [(prompt_index, img_tensor), ...]
-    parsed_pos = _parse_prompt_groups(preview_positive_prompt) if preview_positive_prompt else []
-    parsed_neg = _parse_prompt_groups(preview_negative_prompt) if preview_negative_prompt else []
+    parsed_pos = _parse_prompt_groups(preview_positive_prompt) if preview_positive_prompt and not _use_instance_image else []
+    parsed_neg = _parse_prompt_groups(preview_negative_prompt) if preview_negative_prompt and not _use_instance_image else []
 
     if preview_enable and pv_vae is not None:
         try:
             checkpoints = sorted(output_dir.glob("*.safetensors"), key=lambda p: p.stat().st_mtime)
-            num_prompts_per_ckpt = len(parsed_pos) if parsed_pos else 1
-            total_previews = len(checkpoints) * num_prompts_per_ckpt
-            print(f"[md_soya] Post-hoc preview: found {len(checkpoints)} checkpoints, {num_prompts_per_ckpt} prompts each = {total_previews} total")
-            _notify_phase(f"Preview 0/{total_previews}...")
-            _send_ws_progress("preview_start", total=total_previews)
-            t_preview_start = time.monotonic()
-            for ckpt in checkpoints:
-                print(f"[md_soya] Sampling preview for {ckpt.name}...")
-                try:
-                    comfy.model_management.unload_all_models()
-                    if callable(soft_empty_cache):
-                        soft_empty_cache()
 
-                    m_patched, c_patched = patch_lora_onto_models(
-                        pv_model, pv_clip, str(ckpt), model_strength, clip_strength,
-                        block_weight=resolved_train.block_weight,
-                    )
+            if _use_instance_image:
+                # Instance mode: use the first training image as preview instead of sampling
+                first_img = images[0:1]
+                print(f"[md_soya] Instance mode: using first training image as preview for {len(checkpoints)} checkpoints")
+                for ckpt in checkpoints:
+                    preview_images.append(first_img)
+                    preview_map[ckpt] = [(0, first_img)]
+                    print(f"[md_soya] Instance preview for {ckpt.name}: {first_img.shape}")
+                _notify_phase(f"Instance preview done ({len(checkpoints)} checkpoints)")
+            else:
+                num_prompts_per_ckpt = len(parsed_pos) if parsed_pos else 1
+                total_previews = len(checkpoints) * num_prompts_per_ckpt
+                print(f"[md_soya] Post-hoc preview: found {len(checkpoints)} checkpoints, {num_prompts_per_ckpt} prompts each = {total_previews} total")
+                _notify_phase(f"Preview 0/{total_previews}...")
+                _send_ws_progress("preview_start", total=total_previews)
+                t_preview_start = time.monotonic()
+                for ckpt in checkpoints:
+                    print(f"[md_soya] Sampling preview for {ckpt.name}...")
+                    try:
+                        comfy.model_management.unload_all_models()
+                        if callable(soft_empty_cache):
+                            soft_empty_cache()
 
-                    w = preview_width if preview_width > 0 else (context["images"].shape[2] if "images" in context else 512)
-                    h = preview_height if preview_height > 0 else (context["images"].shape[1] if "images" in context else 512)
+                        m_patched, c_patched = patch_lora_onto_models(
+                            pv_model, pv_clip, str(ckpt), model_strength, clip_strength,
+                            block_weight=resolved_train.block_weight,
+                        )
 
-                    preview_map[ckpt] = []
-                    if parsed_pos:
-                        # Multi-prompt mode: generate one preview per prompt group
-                        for pi, pos_text in enumerate(parsed_pos):
-                            neg_text = parsed_neg[pi] if pi < len(parsed_neg) else (parsed_neg[-1] if parsed_neg else "")
+                        w = preview_width if preview_width > 0 else (context["images"].shape[2] if "images" in context else 512)
+                        h = preview_height if preview_height > 0 else (context["images"].shape[1] if "images" in context else 512)
+
+                        preview_map[ckpt] = []
+                        if parsed_pos:
+                            # Multi-prompt mode: generate one preview per prompt group
+                            for pi, pos_text in enumerate(parsed_pos):
+                                neg_text = parsed_neg[pi] if pi < len(parsed_neg) else (parsed_neg[-1] if parsed_neg else "")
+                                img = generate_preview(
+                                    m_patched, c_patched, pv_vae,
+                                    pos_text, neg_text,
+                                    w, h,
+                                    preview_seed + len(preview_images),
+                                    preview_steps, preview_cfg,
+                                    preview_sampler, preview_scheduler,
+                                )
+                                preview_images.append(img)
+                                preview_map[ckpt].append((pi + 1, img))
+                                done = len(preview_images)
+                                elapsed = time.monotonic() - t_preview_start
+                                avg_s = elapsed / done
+                                remain_s = avg_s * (total_previews - done)
+                                remain_m = remain_s / 60
+                                _notify_phase(f"Preview {done}/{total_previews} (~{remain_m:.1f}min left)")
+                                _send_ws_progress("preview",
+                                    current=done, total=total_previews,
+                                    remaining_min=round(remain_m, 1),
+                                    checkpoint=ckpt.name)
+                                print(f"[md_soya] Preview done for {ckpt.name} [{pi+1}/{len(parsed_pos)}] ({done}/{total_previews}): {img.shape}")
+                        else:
+                            # Legacy single-prompt mode
+                            entries = context.get("entries", [])
+                            idx = min(preview_prompt_index, len(entries) - 1) if entries else 0
+                            entry = entries[idx] if entries else {"positive_tags": "", "negative_tags": ""}
                             img = generate_preview(
                                 m_patched, c_patched, pv_vae,
-                                pos_text, neg_text,
+                                entry.get("positive_tags", ""), entry.get("negative_tags", ""),
                                 w, h,
                                 preview_seed + len(preview_images),
                                 preview_steps, preview_cfg,
                                 preview_sampler, preview_scheduler,
                             )
                             preview_images.append(img)
-                            preview_map[ckpt].append((pi + 1, img))
+                            preview_map[ckpt].append((0, img))
                             done = len(preview_images)
                             elapsed = time.monotonic() - t_preview_start
                             avg_s = elapsed / done
@@ -822,45 +868,19 @@ def _execute_reference_lora(
                                 current=done, total=total_previews,
                                 remaining_min=round(remain_m, 1),
                                 checkpoint=ckpt.name)
-                            print(f"[md_soya] Preview done for {ckpt.name} [{pi+1}/{len(parsed_pos)}] ({done}/{total_previews}): {img.shape}")
-                    else:
-                        # Legacy single-prompt mode
-                        entries = context.get("entries", [])
-                        idx = min(preview_prompt_index, len(entries) - 1) if entries else 0
-                        entry = entries[idx] if entries else {"positive_tags": "", "negative_tags": ""}
-                        img = generate_preview(
-                            m_patched, c_patched, pv_vae,
-                            entry.get("positive_tags", ""), entry.get("negative_tags", ""),
-                            w, h,
-                            preview_seed + len(preview_images),
-                            preview_steps, preview_cfg,
-                            preview_sampler, preview_scheduler,
-                        )
-                        preview_images.append(img)
-                        preview_map[ckpt].append((0, img))
-                        done = len(preview_images)
-                        elapsed = time.monotonic() - t_preview_start
-                        avg_s = elapsed / done
-                        remain_s = avg_s * (total_previews - done)
-                        remain_m = remain_s / 60
-                        _notify_phase(f"Preview {done}/{total_previews} (~{remain_m:.1f}min left)")
-                        _send_ws_progress("preview",
-                            current=done, total=total_previews,
-                            remaining_min=round(remain_m, 1),
-                            checkpoint=ckpt.name)
-                        print(f"[md_soya] Preview done for {ckpt.name} ({done}/{total_previews}): {img.shape}")
-                except Exception as exc:
-                    print(f"[md_soya] Preview failed for {ckpt.name}: {exc}")
-                    continue
-                finally:
-                    del m_patched, c_patched
-                    comfy.model_management.unload_all_models()
+                            print(f"[md_soya] Preview done for {ckpt.name} ({done}/{total_previews}): {img.shape}")
+                    except Exception as exc:
+                        print(f"[md_soya] Preview failed for {ckpt.name}: {exc}")
+                        continue
+                    finally:
+                        del m_patched, c_patched
+                        comfy.model_management.unload_all_models()
         except Exception as exc:
             print(f"[md_soya] Post-hoc preview error: {exc}")
 
     # --- No-LoRA comparison previews (unpatched preview model/clip) ---
     no_lora_images = []  # [(prompt_index, img_tensor), ...]
-    if preview_no_lora and preview_enable and pv_vae is not None:
+    if preview_no_lora and preview_enable and pv_vae is not None and not _use_instance_image:
         try:
             comfy.model_management.unload_all_models()
             if callable(soft_empty_cache):
