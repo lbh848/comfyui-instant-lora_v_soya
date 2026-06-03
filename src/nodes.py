@@ -738,22 +738,22 @@ def _execute_reference_lora(
             "config_path": str(config_path),
         },
     )
-    # --- preview auto-save_every_n_steps injection ---
+    # --- save_every_n_steps handling ---
     _use_instance_image = (
         preview_positive_prompt.strip() == "instance"
         and preview_negative_prompt.strip() == "instance"
     )
-    if preview_enable and not _use_instance_image and resolved_train.save_every_n_steps <= 0:
+    if _use_instance_image:
+        config_text = config_path.read_text(encoding="utf-8")
+        config_text = re.sub(r"(?m)^save_every_n_steps\s*=.*\n?", "", config_text)
+        config_path.write_text(config_text, encoding="utf-8")
+        print(f"[md_soya] instance mode: skipping intermediate saves, final checkpoint only")
+    elif preview_enable and resolved_train.save_every_n_steps <= 0:
         auto_save_every = max(1, target_steps // 4)
         config_text = config_path.read_text(encoding="utf-8")
         config_text = _set_toml_key(config_text, "save_every_n_steps", auto_save_every)
         config_path.write_text(config_text, encoding="utf-8")
         print(f"[md_soya] preview enabled, auto save_every_n_steps={auto_save_every}")
-    elif preview_enable and _use_instance_image:
-        config_text = config_path.read_text(encoding="utf-8")
-        config_text = re.sub(r"(?m)^save_every_n_steps\s*=.*\n?", "", config_text)
-        config_path.write_text(config_text, encoding="utf-8")
-        print(f"[md_soya] instance mode: skipping intermediate saves, final checkpoint only")
 
     comfy.model_management.unload_all_models()
     soft_empty_cache = getattr(comfy.model_management, "soft_empty_cache", None)
