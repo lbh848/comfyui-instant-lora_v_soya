@@ -751,7 +751,7 @@ def _execute_reference_lora(
         print(f"[md_soya] preview enabled, auto save_every_n_steps={auto_save_every}")
     elif preview_enable and _use_instance_image:
         config_text = config_path.read_text(encoding="utf-8")
-        config_text = _set_toml_key(config_text, "save_every_n_steps", 0)
+        config_text = re.sub(r"(?m)^save_every_n_steps\s*=.*\n?", "", config_text)
         config_path.write_text(config_text, encoding="utf-8")
         print(f"[md_soya] instance mode: skipping intermediate saves, final checkpoint only")
 
