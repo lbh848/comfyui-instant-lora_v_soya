@@ -146,6 +146,25 @@ def _parse_prompt_groups(text: str) -> list[str]:
     return [p.strip() for p in parts if p.strip()]
 
 
+def _load_first_image_as_batch(images_dir):
+    """경로 모드에서 preview 용 첫 이미지를 (1,H,W,3) float32 텐서로 로드.
+
+    텐서 모드의 images[0:1] 과 동일한 역할. instance preview 에서 사용.
+    """
+    import numpy as np
+    from PIL import Image as PILImage, ImageOps
+    files = sorted(
+        [p for p in images_dir.iterdir() if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS],
+        key=lambda p: p.name,
+    )
+    if not files:
+        raise RuntimeError(f"preview 용 이미지가 폴더에 없습니다: {images_dir}")
+    img = ImageOps.exif_transpose(PILImage.open(files[0])).convert("RGB")
+    arr = np.array(img).astype(np.float32) / 255.0
+    return torch.from_numpy(arr)[None,]
+
+
+
 def _tagging_options_from_input(value: Any | None) -> TaggingOptions:
     if not value:
         return TaggingOptions()
@@ -637,9 +656,20 @@ def _execute_reference_lora(
 
     if context is None:
         raise RuntimeError("context input is required. Connect a Context Builder node.")
-    images = context["images"]
-    per_image_tags = context["entries"]
-    print(f"[md_soya] images shape={getattr(images, 'shape', 'N/A')}, per_image_tags count={len(per_image_tags)}")
+    # mode 호환: "path" 면 이미지를 텐서로 올리지 않고 폴더 경로로 학습(source_dir 모드).
+    #            그 외(기존) 는 context["images"] 텐서를 그대로 사용.
+    context_mode = context.get("mode", "tensor")
+    is_path_mode = (context_mode == "path")
+    if is_path_mode:
+        images_dir = Path(context["images_dir"])
+        images = None
+        per_image_tags = context["entries"]
+        print(f"[md_soya] PATH MODE: images_dir={images_dir}, per_image_tags count={len(per_image_tags)}")
+    else:
+        images = context["images"]
+        images_dir = None
+        per_image_tags = context["entries"]
+        print(f"[md_soya] images shape={getattr(images, 'shape', 'N/A')}, per_image_tags count={len(per_image_tags)}")
     for entry in per_image_tags:
         print(f"[md_soya]   image {entry['index']}: positive={repr(entry.get('positive_tags', ''))}, negative={repr(entry.get('negative_tags', ''))}")
 
@@ -659,7 +689,10 @@ def _execute_reference_lora(
     checkpoint_path = _recover_model_checkpoint_path(model)
     print(f"[md_soya] checkpoint_path={checkpoint_path}")
 
-    temp_image_hash = hash_tensor_batch(images)
+    if is_path_mode:
+        temp_image_hash = hash_directory_images(images_dir)
+    else:
+        temp_image_hash = hash_tensor_batch(images)
     print(f"[md_soya] image_hash={temp_image_hash}")
 
     paths = get_runtime_paths()
@@ -673,6 +706,7 @@ def _execute_reference_lora(
         log_path=temp_run_log,
         options=resolved_tagging,
         target_steps=target_steps,
+        source_dir=images_dir,
         per_image_tags=per_image_tags,
     )
     print(f"[md_soya] dataset prepared: {dataset_dir}, captions count={len(captions)}")
@@ -788,7 +822,10 @@ def _execute_reference_lora(
 
             if _use_instance_image:
                 # Instance mode: use the first training image as preview instead of sampling
-                first_img = images[0:1]
+                if is_path_mode:
+                    first_img = _load_first_image_as_batch(images_dir)
+                else:
+                    first_img = images[0:1]
                 print(f"[md_soya] Instance mode: using first training image as preview for {len(checkpoints)} checkpoints")
                 for ckpt in checkpoints:
                     preview_images.append(first_img)
@@ -1293,9 +1330,99 @@ class ContextBuilderV1:
         return ({"images": images, "entries": entries},)
 
 
+class ContextBuilderPathOnlyV1:
+    """경로 전용 컨텍스트 빌더.
+
+    이미지를 텐서로 로드하지 않고 폴더 경로(path)만 받아 context를 빌드한다.
+    Instant Reference LoRA 가 mode=="path" 분기로 source_dir 학습을 수행한다.
+    멀티이미지 로드 경로 파싱 결과(STRING)를 path 입력에 직결한다.
+    """
+
+    CATEGORY = "reference/training"
+    RETURN_TYPES = ("CONTEXT",)
+    RETURN_NAMES = ("context",)
+    FUNCTION = "build"
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "positive_prompt": ("STRING", {"default": "", "multiline": True}),
+                "negative_prompt": ("STRING", {"default": "", "multiline": True}),
+                "path": ("STRING", {"default": "", "multiline": False}),
+            }
+        }
+
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        return float("nan")
+
+    def build(self, positive_prompt, negative_prompt, path):
+        import folder_paths
+        path = (path or "").strip()
+        if not path:
+            raise RuntimeError("path(이미지 폴더)가 비어 있습니다. LoadImagesFromPath 경로 파싱 결과를 연결하세요.")
+        if not os.path.isabs(path):
+            path = os.path.join(folder_paths.get_input_directory(), path)
+        if not os.path.isdir(path):
+            raise RuntimeError(f"이미지 폴더를 찾을 수 없습니다: {path}")
+        images_dir = Path(path)
+
+        # 폴더 내 이미지 목록. 자연 정렬로 [1],[2],...,[10] 순서 보장(문자열 정렬 방지).
+        image_files = [p for p in images_dir.iterdir() if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS]
+
+        def _nat_key(p):
+            m = re.search(r"\[(\d+)\]", p.name)
+            return (int(m.group(1)) if m else 10 ** 9, p.name)
+
+        image_files.sort(key=_nat_key)
+        if not image_files:
+            raise RuntimeError(f"폴더에 이미지가 없습니다: {images_dir}")
+
+        num_images = len(image_files)
+        pos_groups = _parse_prompt_groups(positive_prompt)
+        neg_groups = _parse_prompt_groups(negative_prompt)
+        print(f"[md_soya] ContextBuilder(path): images_dir={images_dir}, image_count={num_images}, pos_groups={len(pos_groups)}, neg_groups={len(neg_groups)}")
+
+        if not pos_groups:
+            raise RuntimeError("positive_prompt 에 [N]태그 그룹이 하나 이상 필요합니다. 형식: [1]태그\\n[2]태그 ...")
+        if len(pos_groups) != num_images:
+            raise RuntimeError(f"positive_prompt 그룹 수({len(pos_groups)})와 폴더 이미지 수({num_images})가 다릅니다.")
+        if neg_groups and len(neg_groups) != num_images:
+            raise RuntimeError(f"negative_prompt 그룹 수({len(neg_groups)})와 폴더 이미지 수({num_images})가 다릅니다.")
+
+        entries = []
+        for i in range(num_images):
+            entries.append({
+                "index": i,
+                "positive_tags": pos_groups[i],
+                "negative_tags": neg_groups[i] if i < len(neg_groups) else "",
+            })
+
+        # per-image 캡션 .txt 를 폴더에 미리 작성.
+        # 이유: _prepare_dataset 의 source_dir 모드는 image_NNN.png 파일명을 가정해 캡션을 생성하지만,
+        #       실제 파일명은 [1].png 등이므로 캡션이 매칭되지 않는다.
+        #       폴더에 <이미지명>.txt 를 써두면 source_dir 복사 시 함께 복사되어 sd-scripts 가 읽는다.
+        for i, img_path in enumerate(image_files):
+            caption_path = img_path.with_suffix(".txt")
+            try:
+                caption_path.write_text(entries[i]["positive_tags"].strip(), encoding="utf-8")
+            except Exception as e:
+                print(f"[md_soya] ContextBuilder(path): 캡션 작성 실패 {caption_path}: {e}")
+
+        context = {
+            "mode": "path",
+            "images_dir": str(images_dir),
+            "image_count": num_images,
+            "entries": entries,
+        }
+        return (context,)
+
+
 NODE_CLASS_MAPPINGS = {
     "md_soya_InstantReferenceLoRA": InstantReferenceLoRAV1,
     "md_soya_ContextBuilder": ContextBuilderV1,
+    "md_soya_ContextBuilderPathOnly": ContextBuilderPathOnlyV1,
     "md_soya_ReferenceTaggingOptions": TaggingOptionsV1,
     "md_soya_ReferenceTrainOptions": TrainOptionsV1,
 }
@@ -1303,6 +1430,7 @@ NODE_CLASS_MAPPINGS = {
 NODE_DISPLAY_NAME_MAPPINGS = {
     "md_soya_InstantReferenceLoRA": "md_soya Instant Reference LoRA",
     "md_soya_ContextBuilder": "md_soya Context Builder",
+    "md_soya_ContextBuilderPathOnly": "md_soya Context Builder_pathONLY",
     "md_soya_ReferenceTaggingOptions": "md_soya Reference Tagging Options",
     "md_soya_ReferenceTrainOptions": "md_soya Reference Train Options",
 }
