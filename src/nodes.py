@@ -17,6 +17,7 @@ import comfy.model_management
 import comfy.utils
 from comfy_api.latest import ComfyExtension, io
 
+from .attention_backend import resolve_runtime_attention
 from .profiles import ProfileDefinition, SlotSpec, load_profiles, profile_map, profiles_fingerprint, replace_profile_tokens
 from .runtime import (
     IMAGE_EXTENSIONS,
@@ -542,6 +543,7 @@ def _write_resolved_config(
     builtins: dict[str, str],
     run_dir: Path,
     train_options: TrainOptions,
+    runtime_python: str | Path,
 ) -> Path:
     config_path = run_dir / "config.toml"
     rendered = replace_profile_tokens(
@@ -550,7 +552,12 @@ def _write_resolved_config(
         builtins,
     )
     rendered = _apply_train_options(rendered, train_options)
+    rendered, attention_mode = resolve_runtime_attention(rendered, runtime_python)
     config_path.write_text(rendered, encoding="utf-8")
+    print(
+        "[md_soya] resolved training attention backend: "
+        f"mode={attention_mode or 'profile_default'}"
+    )
     return config_path
 
 
@@ -756,7 +763,14 @@ def _execute_reference_lora(
     _send_ws_progress("preparing", message=f"Training ({target_steps} steps)...")
     ensure_sd_scripts_environment(paths, log_path=run_log)
     builtins = _builtins_for_run(dataset_dir, output_dir, output_name)
-    config_path = _write_resolved_config(selected_profile, resolved_slots, builtins, run_dir, resolved_train)
+    config_path = _write_resolved_config(
+        selected_profile,
+        resolved_slots,
+        builtins,
+        run_dir,
+        resolved_train,
+        venv_python(paths.venv),
+    )
     print(f"[md_soya] config written to {config_path}")
     write_json(
         manifest,
