@@ -219,6 +219,20 @@ def python_version_tuple(python_executable: str | Path) -> tuple[int, int] | Non
 
 def resolve_runtime_python() -> str:
     if os.name == "nt":
+        # comfy-installer: use the project-managed Python 3.12 runtime
+        configured_python = os.environ.get("COMFYUI_INSTANT_LORA_PYTHON")
+        if configured_python:
+            if python_version_tuple(configured_python) == (3, 12):
+                return str(Path(configured_python).resolve())
+            raise RuntimeError(
+                "COMFYUI_INSTANT_LORA_PYTHON must point to Python 3.12: "
+                f"{configured_python}"
+            )
+
+        base_python = getattr(sys, "_base_executable", "") or sys.executable
+        if python_version_tuple(base_python) == (3, 12):
+            return str(Path(base_python).resolve())
+
         try:
             result = subprocess.run(
                 ["py", "-3.12", "-c", "import sys; print(sys.executable)"],

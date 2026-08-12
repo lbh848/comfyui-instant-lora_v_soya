@@ -493,6 +493,28 @@ def _set_toml_key(config_text: str, key: str, value: Any) -> str:
     return config_text + replacement + "\n"
 
 
+def _gpu_supports_bf16() -> bool:
+    """현재 ComfyUI 프로세스가 사용 중인 GPU가 bf16(Ampere 이상, cc>=8.0)을 지원하는지 확인.
+
+    ComfyUI는 --cuda-device N 으로 GPU를 고정하므로 current_device()가 곧 학습 GPU.
+    조회에 실패하면 기본값(True)을 유지해 기존 동작을 보존한다.
+    """
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            return True
+        device = torch.cuda.current_device()
+        major, _ = torch.cuda.get_device_capability(device)
+        return major >= 8
+    except Exception as exc:
+        print(
+            "[md_soya] GPU bf16 지원 여부 조회 실패, 기본값(bf16 유지) 사용: "
+            f"{type(exc).__name__}: {exc}"
+        )
+        return True
+
+
 def _apply_train_options(config_text: str, options: TrainOptions) -> str:
     overrides: dict[str, Any] = {}
     if options.steps_override > 0:
@@ -522,6 +544,19 @@ def _apply_train_options(config_text: str, options: TrainOptions) -> str:
         overrides["persistent_data_loader_workers"] = False
     if options.seed_override >= 0:
         overrides["seed"] = options.seed_override
+
+    # bf16 미지원 GPU(compute capability < 8.0)에서 학습이 hang되는 것을 방지.
+    # config가 bf16일 때만 fp16으로 강등하고, 다른 precision은 그대로 둔다.
+    if not _gpu_supports_bf16():
+        precision_match = MIXED_PRECISION_PATTERN.search(config_text)
+        if precision_match and precision_match.group(1).strip().lower() == "bf16":
+            overrides["mixed_precision"] = "fp16"
+            overrides["save_precision"] = "fp16"
+            print(
+                "[md_soya] GPU가 bf16을 지원하지 않음(compute capability < 8.0). "
+                "mixed_precision/save_precision을 fp16으로 강등합니다."
+            )
+
     for key, value in overrides.items():
         config_text = _set_toml_key(config_text, key, value)
     return config_text
