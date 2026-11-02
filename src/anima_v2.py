@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import runpy
 import sys
 import tomllib
 import traceback
@@ -23,6 +24,7 @@ def prepare_training(profile, slots, builtins, run_dir, options, v2_options, log
     # repeat-folder config, so it needs its own config at this boundary.
     from .nodes import _format_toml_value
 
+    runpy.run_path(str(plugin_root() / "install.py"), run_name="__main__")
     engine = Path(v2_options.get("engine_path") or plugin_root() / "runtime" / "anima_lora").resolve()
     if not (engine / "train.py").is_file():
         message = f"Anima V2 학습 엔진을 찾을 수 없습니다: {engine / 'train.py'}"

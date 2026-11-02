@@ -86,7 +86,9 @@ V2 disables TensorBoard logs and progress JSONL output; the node retains its dia
 `run.log`. The resolved image dimensions are printed during preprocessing and recorded
 in the run's `commands.json` for comparisons.
 
-The local installation uses these source checkouts under this node's `runtime/`:
+The application's Install and Update buttons install this node's requirements.
+During the following ComfyUI startup, the node automatically downloads these
+source checkouts into its own `runtime/` and checks the training/cache commands:
 
 - `anima_lora`: commit `eca845a5e059208509b4f9a922a7c2ad249b10bf`.
 - `anime_tools`: tag `v0.9.3`, commit `1fac04b4eb4b503bdac9ebd7a6ad6b5261e6f4da`.
@@ -97,8 +99,10 @@ ComfyUI Python 3.12.11, PyTorch 2.10.0+cu130 and triton-windows 3.6.0.post25. Bo
 ordinary LoRA and T-LoRA completed three steps and saved checkpoints on an RTX 4080.
 This does not establish compatibility of the upstream GUI or other model families.
 
-Additional packages installed into the existing ComfyUI environment were
-`voluptuous`, `tomlkit`, `imagesize`, `tensorboard`, `prodigyopt`,
-`pytorch-optimizer` and `softtorch`, with their dependencies. No new virtual
-environment is created by the V2 nodes. Engine sources and packages must be installed
-before execution; `engine_path` can select an existing anima_lora checkout.
+No manual engine download, shell command or path setting is needed. Missing packages
+are also installed automatically when the node loads. A ready marker avoids downloads
+and command checks on subsequent starts; setup failures are logged and retried on the
+next start. The automatic setup uses the existing ComfyUI Python environment and
+creates no additional virtual environment. It does not modify ComfyUI or host-project
+source/configuration. The existing V1 backend and workflows remain available.
+`engine_path` can still select an existing anima_lora checkout.

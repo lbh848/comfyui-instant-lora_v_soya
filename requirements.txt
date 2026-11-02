@@ -1,1 +1,13 @@
-# Add runtime dependencies here when your nodes need them.
+# ANIMA V2 uses ComfyUI's Python 3.12 environment. V1 keeps its existing backend.
+# Do not install upstream pyprojects: their GUI stacks require Python 3.13.
+accelerate>=1.13.0; python_version >= '3.12'
+diffusers>=0.39.0; python_version >= '3.12'
+imagesize==2.0.1; python_version >= '3.12'
+prodigyopt==1.1.2; python_version >= '3.12'
+pytorch-optimizer==4.1.0; python_version >= '3.12'
+rich>=14.0.0; python_version >= '3.12'
+softtorch==0.1.1; python_version >= '3.12'
+tensorboard==2.21.0; python_version >= '3.12'
+toml>=0.10.2; python_version >= '3.12'
+tomlkit==0.15.2; python_version >= '3.12'
+voluptuous==0.16.0; python_version >= '3.12'
