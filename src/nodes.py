@@ -5,6 +5,7 @@ import json
 import os
 import re
 import secrets
+import traceback
 import shutil
 import tempfile
 import time
@@ -14,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 import comfy.model_management
+import comfy.samplers
 import comfy.utils
 from comfy_api.latest import ComfyExtension, io
 
@@ -596,25 +598,24 @@ def _write_resolved_config(
     return config_path
 
 
-def _run_training(profile: ProfileDefinition, run_dir: Path, output_dir: Path, config_path: Path, log_path: Path, total_steps: int | None = None) -> tuple[Path, dict[int, float]]:
+def _run_training(profile: ProfileDefinition, run_dir: Path, output_dir: Path, config_path: Path, log_path: Path, total_steps: int | None = None, training_process=None) -> tuple[Path, dict[int, float]]:
     paths = get_runtime_paths()
-    ensure_sd_scripts_environment(paths, log_path=log_path)
-    python_path = venv_python(paths.venv)
-    training_script = resolve_sd_scripts_file(paths, profile.script)
-    command = [str(python_path)]
-    if os.name == "nt":
-        command.extend(
-            [
-                "-m",
-                "accelerate.commands.launch",
-                "--num_cpu_threads_per_process",
-                "2",
-            ]
-        )
-        mixed_precision = _accelerate_mixed_precision(config_path)
-        if mixed_precision is not None:
-            command.extend(["--mixed_precision", mixed_precision])
-    command.extend([str(training_script), "--config_file", str(config_path)])
+    if training_process is None:
+        ensure_sd_scripts_environment(paths, log_path=log_path)
+        python_path = venv_python(paths.venv)
+        training_script = resolve_sd_scripts_file(paths, profile.script)
+        command = [str(python_path)]
+        if os.name == "nt":
+            command.extend(
+                ["-m", "accelerate.commands.launch", "--num_cpu_threads_per_process", "2"]
+            )
+            mixed_precision = _accelerate_mixed_precision(config_path)
+            if mixed_precision is not None:
+                command.extend(["--mixed_precision", mixed_precision])
+        command.extend([str(training_script), "--config_file", str(config_path)])
+        training_cwd, training_env = paths.sd_scripts, None
+    else:
+        command, training_cwd, training_env = training_process
 
     pbar = comfy.utils.ProgressBar(total_steps) if total_steps and total_steps > 0 else None
     t_train_start = time.monotonic()
@@ -652,7 +653,15 @@ def _run_training(profile: ProfileDefinition, run_dir: Path, output_dir: Path, c
                     ws_data["avr_loss"] = round(loss_history[current], 6)
                 _send_ws_progress("training", **ws_data)
 
-    run_command(command, cwd=paths.sd_scripts, log_path=log_path, line_callback=on_line)
+    run_command(command, cwd=training_cwd, log_path=log_path, env=training_env, line_callback=on_line)
+    if training_process is not None:
+        # The Anima engine saves step checkpoints below output_name/. The
+        # existing retention, preview and sidecar pipeline expects them here.
+        for checkpoint in output_dir.rglob("*.safetensors"):
+            if checkpoint.parent != output_dir:
+                target = output_dir / checkpoint.name
+                checkpoint.rename(target)
+                print(f"[Anima V2] checkpoint ready for preview: {target}")
     trained_lora = latest_safetensors(output_dir)
     if trained_lora is None:
         raise RuntimeError(f"Training completed but no LoRA file was found in {output_dir}")
@@ -679,8 +688,10 @@ def _execute_reference_lora(
     preview_positive_prompt="", preview_negative_prompt="",
     preview_no_lora=False,
     preview_model=None, preview_clip=None, preview_vae=None,
+    anima_v2=False,
 ) -> tuple:
     print("[md_soya] _execute_reference_lora called")
+    preview_spectrum = anima_v2 and (train_options or {}).get("preview_spectrum", True)
     # Fallback: use training model/clip/vae for preview if separate preview inputs not provided
     pv_model = preview_model if preview_model is not None else model
     pv_clip = preview_clip if preview_clip is not None else clip
@@ -779,6 +790,8 @@ def _execute_reference_lora(
         tagging_options=resolved_tagging,
         train_options=resolved_train,
     )
+    if anima_v2:
+        cache_key = f"anima_v2_{cache_key}_{secrets.token_hex(4)}"
     print(f"[md_soya] cache_key={cache_key}")
 
     run_dir = ensure_dir(paths.cache / cache_key)
@@ -796,16 +809,22 @@ def _execute_reference_lora(
     print("[md_soya] starting training...")
     _notify_phase(f"Training ({target_steps} steps)...")
     _send_ws_progress("preparing", message=f"Training ({target_steps} steps)...")
-    ensure_sd_scripts_environment(paths, log_path=run_log)
     builtins = _builtins_for_run(dataset_dir, output_dir, output_name)
-    config_path = _write_resolved_config(
-        selected_profile,
-        resolved_slots,
-        builtins,
-        run_dir,
-        resolved_train,
-        venv_python(paths.venv),
-    )
+    training_process = None
+    if anima_v2:
+        from .anima_v2 import prepare_training
+        comfy.model_management.unload_all_models()
+        comfy.model_management.soft_empty_cache()
+        config_path, training_process = prepare_training(
+            selected_profile, resolved_slots, builtins, run_dir,
+            resolved_train, train_options or {}, run_log,
+        )
+    else:
+        ensure_sd_scripts_environment(paths, log_path=run_log)
+        config_path = _write_resolved_config(
+            selected_profile, resolved_slots, builtins, run_dir,
+            resolved_train, venv_python(paths.venv),
+        )
     print(f"[md_soya] config written to {config_path}")
     write_json(
         manifest,
@@ -843,7 +862,7 @@ def _execute_reference_lora(
     if callable(soft_empty_cache):
         soft_empty_cache()
     print("[md_soya] calling _run_training...")
-    trained_lora, loss_history = _run_training(selected_profile, run_dir, output_dir, config_path, log_path=run_log, total_steps=target_steps)
+    trained_lora, loss_history = _run_training(selected_profile, run_dir, output_dir, config_path, log_path=run_log, total_steps=target_steps, training_process=training_process)
     print(f"[md_soya] training done, lora={trained_lora}, loss_history={len(loss_history)} entries")
     _notify_phase("Training complete!")
     _send_ws_progress("training_complete", message="Training complete!", lora_path=str(trained_lora))
@@ -915,6 +934,7 @@ def _execute_reference_lora(
                                     preview_seed + len(preview_images),
                                     preview_steps, preview_cfg,
                                     preview_sampler, preview_scheduler,
+                                    spectrum=preview_spectrum,
                                 )
                                 preview_images.append(img)
                                 preview_map[ckpt].append((pi + 1, img))
@@ -941,6 +961,7 @@ def _execute_reference_lora(
                                 preview_seed + len(preview_images),
                                 preview_steps, preview_cfg,
                                 preview_sampler, preview_scheduler,
+                                spectrum=preview_spectrum,
                             )
                             preview_images.append(img)
                             preview_map[ckpt].append((0, img))
@@ -957,12 +978,14 @@ def _execute_reference_lora(
                             print(f"[md_soya] Preview done for {ckpt.name} ({done}/{total_previews}): {img.shape}")
                     except Exception as exc:
                         print(f"[md_soya] Preview failed for {ckpt.name}: {exc}")
+                        traceback.print_exc()
                         continue
                     finally:
                         del m_patched, c_patched
                         comfy.model_management.unload_all_models()
         except Exception as exc:
             print(f"[md_soya] Post-hoc preview error: {exc}")
+            traceback.print_exc()
 
     # --- No-LoRA comparison previews (unpatched preview model/clip) ---
     no_lora_images = []  # [(prompt_index, img_tensor), ...]
@@ -985,6 +1008,7 @@ def _execute_reference_lora(
                         preview_seed + len(preview_images),
                         preview_steps, preview_cfg,
                         preview_sampler, preview_scheduler,
+                        spectrum=preview_spectrum,
                     )
                     no_lora_images.append((pi + 1, img))
                     preview_images.append(img)
@@ -1000,6 +1024,7 @@ def _execute_reference_lora(
                     preview_seed + len(preview_images),
                     preview_steps, preview_cfg,
                     preview_sampler, preview_scheduler,
+                    spectrum=preview_spectrum,
                 )
                 no_lora_images.append((0, img))
                 preview_images.append(img)
@@ -1008,6 +1033,7 @@ def _execute_reference_lora(
             comfy.model_management.unload_all_models()
         except Exception as exc:
             print(f"[md_soya] No-LoRA preview error: {exc}")
+            traceback.print_exc()
 
     # 전체 완료
     _send_ws_progress("all_complete", message="All done!", lora_path=str(trained_lora))
@@ -1210,8 +1236,8 @@ class InstantReferenceLoRAV1:
                 "preview_seed": ("INT", {"default": 42, "min": 0, "max": 0xffffffffffffffff}),
                 "preview_steps": ("INT", {"default": 20, "min": 1, "max": 100}),
                 "preview_cfg": ("FLOAT", {"default": 7.0, "min": 0.0, "max": 100.0, "step": 0.1}),
-                "preview_sampler": (["euler", "euler_ancestral", "heun", "dpm_2", "dpm_2_ancestral", "lms", "ddim", "ddpm", "deis", "dpm_fast", "dpm_adaptive", "dpmpp_2s_ancestral", "dpmpp_sde", "dpmpp_sde_gpu", "dpmpp_2m", "dpmpp_2m_sde", "dpmpp_2m_sde_gpu", "dpmpp_3m_sde", "dpmpp_3m_sde_gpu", "ipndm", "ipndm_v", "uni_pc", "uni_pc_bh2"], {"default": "euler"}),
-                "preview_scheduler": (["normal", "karras", "exponential", "sgm_uniform", "simple", "ddim_uniform", "beta"], {"default": "normal"}),
+                "preview_sampler": (comfy.samplers.KSampler.SAMPLERS, {"default": "euler"}),
+                "preview_scheduler": (comfy.samplers.KSampler.SCHEDULERS, {"default": "normal"}),
                 "preview_width": ("INT", {"default": 512, "min": 16, "max": 4096, "step": 8}),
                 "preview_height": ("INT", {"default": 512, "min": 16, "max": 4096, "step": 8}),
                 "preview_positive_prompt": ("STRING", {"default": "", "multiline": True}),
@@ -1223,7 +1249,7 @@ class InstantReferenceLoRAV1:
             },
         }
 
-    def run(self, model, clip, model_strength, clip_strength, profile, context, vae=None, save_path="", tagging_options=None, train_options=None, preview_enable=False, preview_prompt_index=0, preview_seed=42, preview_steps=20, preview_cfg=7.0, preview_sampler="euler", preview_scheduler="normal", preview_width=512, preview_height=512, preview_positive_prompt="", preview_negative_prompt="", preview_no_lora=False, preview_model=None, preview_clip=None, preview_vae=None):
+    def run(self, model, clip, model_strength, clip_strength, profile, context, vae=None, save_path="", tagging_options=None, train_options=None, preview_enable=False, preview_prompt_index=0, preview_seed=42, preview_steps=20, preview_cfg=7.0, preview_sampler="euler", preview_scheduler="normal", preview_width=512, preview_height=512, preview_positive_prompt="", preview_negative_prompt="", preview_no_lora=False, preview_model=None, preview_clip=None, preview_vae=None, anima_v2=False):
         print(f"[md_soya] === Instant Reference LoRA started ===")
         print(f"[md_soya] profile={profile}, context={'provided' if context else 'None'}, vae={'provided' if vae else 'None'}")
         print(f"[md_soya] model_strength={model_strength}, clip_strength={clip_strength}, save_path={save_path}")
@@ -1255,6 +1281,7 @@ class InstantReferenceLoRAV1:
                 preview_model=preview_model,
                 preview_clip=preview_clip,
                 preview_vae=preview_vae,
+                anima_v2=anima_v2,
             )
             print(f"[md_soya] === completed ===\n{info}")
             if preview_batch is None:
@@ -1264,6 +1291,11 @@ class InstantReferenceLoRAV1:
             import traceback
             print(f"[md_soya] === ERROR ===\n{traceback.format_exc()}")
             raise
+
+class AnimaReferenceLoRAV2(InstantReferenceLoRAV1):
+    def run(self, *args, **kwargs):
+        return super().run(*args, **kwargs, anima_v2=True)
+
 
 class TaggingOptionsV1:
     CATEGORY = "reference/training"
@@ -1323,6 +1355,29 @@ class TrainOptionsV1:
 
     def build(self, **kwargs):
         return (kwargs,)
+
+
+class AnimaTrainOptionsV2(TrainOptionsV1):
+    @classmethod
+    def INPUT_TYPES(cls):
+        inputs = super().INPUT_TYPES()
+        required = inputs["required"]
+        for name in ("cache_latents", "cache_text_encoder_outputs", "train_text_encoder",
+                     "text_encoder_lr", "block_weight", "force_retrain"):
+            del required[name]
+        required["gradient_checkpointing"][1]["default"] = False
+        required.update({
+            "torch_compile": ("BOOLEAN", {"default": True}),
+            "activation_memory_budget": ("FLOAT", {"default": 0.99, "min": 0.0, "max": 1.0, "step": 0.01,
+                "tooltip": "컴파일 시 저장할 활성화 메모리 비율. Gradient Checkpointing을 켜면 적용하지 않습니다."}),
+            "attn_mode": (["torch", "flash", "flex"],),
+            "use_timestep_mask": ("BOOLEAN", {"default": False, "tooltip": "T-LoRA의 timestep별 rank 마스킹을 사용합니다."}),
+            "engine_path": ("STRING", {"default": "", "tooltip": "Anima 학습 엔진 폴더. 비우면 기본 설치 폴더를 사용합니다."}),
+        })
+        inputs["optional"] = {
+            "preview_spectrum": ("BOOLEAN", {"default": True, "tooltip": "학습 프리뷰에 Spectrum을 적용합니다."}),
+        }
+        return inputs
 
 
 class ContextBuilderV1:
@@ -1469,6 +1524,8 @@ class ContextBuilderPathOnlyV1:
 
 
 NODE_CLASS_MAPPINGS = {
+    "md_soya_AnimaReferenceLoRAV2": AnimaReferenceLoRAV2,
+    "md_soya_AnimaTrainOptionsV2": AnimaTrainOptionsV2,
     "md_soya_InstantReferenceLoRA": InstantReferenceLoRAV1,
     "md_soya_ContextBuilder": ContextBuilderV1,
     "md_soya_ContextBuilderPathOnly": ContextBuilderPathOnlyV1,
@@ -1477,6 +1534,8 @@ NODE_CLASS_MAPPINGS = {
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
+    "md_soya_AnimaReferenceLoRAV2": "md_soya Anima LoRA V2",
+    "md_soya_AnimaTrainOptionsV2": "md_soya Anima Train Options V2",
     "md_soya_InstantReferenceLoRA": "md_soya Instant Reference LoRA",
     "md_soya_ContextBuilder": "md_soya Context Builder",
     "md_soya_ContextBuilderPathOnly": "md_soya Context Builder_pathONLY",

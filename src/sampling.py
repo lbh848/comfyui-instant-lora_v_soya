@@ -141,6 +141,7 @@ def generate_preview(
     width: int, height: int,
     seed: int, steps: int, cfg: float,
     sampler_name: str, scheduler: str,
+    *, spectrum: bool = False,
 ):
     """
     전체 preview 파이프라인.
@@ -148,6 +149,16 @@ def generate_preview(
     """
     positive = encode_conditioning(clip, positive_text)
     negative = encode_conditioning(clip, negative_text)
+    if spectrum:
+        import nodes as comfy_nodes
+
+        patch_class = comfy_nodes.NODE_CLASS_MAPPINGS.get("DiTSpectrumPatch")
+        if patch_class is None:
+            message = "V2 프리뷰에 필요한 comfyui-spectrum-ksampler 노드를 불러오지 못했습니다."
+            print(f"[Anima V2 preview] {message}")
+            raise RuntimeError(message)
+        model, = patch_class().patch(model, steps=steps)
+        print(f"[Anima V2 preview] Spectrum enabled: steps={steps}")
     latent = generate_empty_latent(width, height, batch_size=1)
     latent = sample_latent(model, seed, steps, cfg, sampler_name, scheduler, positive, negative, latent, denoise=1.0)
     images = decode_latent(vae, latent)
