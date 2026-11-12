@@ -731,6 +731,7 @@ def _execute_reference_lora(
     if profile_key not in all_profiles:
         raise RuntimeError(f"Profile '{profile_key}' not found. Available: {list(all_profiles.keys())}")
     selected_profile = all_profiles[profile_key]
+    moss = selected_profile.script == "moss_image_train_network.py"
     print(f"[md_soya] selected profile: {selected_profile.name} (key={selected_profile.key})")
     resolved_tagging = _tagging_options_from_input(tagging_options)
     resolved_train = _train_options_from_input(train_options)
@@ -792,6 +793,8 @@ def _execute_reference_lora(
     )
     if anima_v2:
         cache_key = f"anima_v2_{cache_key}_{secrets.token_hex(4)}"
+    elif moss:
+        cache_key = f"moss_{cache_key}_{secrets.token_hex(4)}"
     print(f"[md_soya] cache_key={cache_key}")
 
     run_dir = ensure_dir(paths.cache / cache_key)
@@ -818,6 +821,14 @@ def _execute_reference_lora(
         config_path, training_process = prepare_training(
             selected_profile, resolved_slots, builtins, run_dir,
             resolved_train, train_options or {}, run_log,
+        )
+    elif moss:
+        from .moss_runtime import prepare_training
+        comfy.model_management.unload_all_models()
+        comfy.model_management.soft_empty_cache()
+        config_path, training_process = prepare_training(
+            selected_profile, resolved_slots, builtins, run_dir, resolved_train,
+            run_log, _write_resolved_config,
         )
     else:
         ensure_sd_scripts_environment(paths, log_path=run_log)

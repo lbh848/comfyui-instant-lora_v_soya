@@ -106,3 +106,24 @@ next start. The automatic setup uses the existing ComfyUI Python environment and
 creates no additional virtual environment. It does not modify ComfyUI or host-project
 source/configuration. The existing V1 backend and workflows remain available.
 `engine_path` can still select an existing anima_lora checkout.
+# MOSS Image INT8 training
+
+The `moss` profile uses sd-scripts v0.12.3 in `runtime/moss`, separately from
+the existing ANIMA and SDXL runtime. Load a non-distilled MOSS Base or SFT
+ConvRot INT8 model, `qwen3.5_9b_int8_convrot.safetensors` with CLIP type
+`moss_image`, and the FLUX.2 VAE. W4A8 GPTQ text encoders are unsupported.
+
+For 16GB GPUs keep batch 1, rank/alpha 16, gradient checkpointing, cached
+latents and cached text outputs enabled, and text encoder training disabled.
+The frozen base uses INT8 while the adapter is saved in BF16. The upstream
+memory table reports approximately 9.1GB at 1024 resolution and rank 16;
+actual usage depends on the input captions and buckets.
+
+The runtime installs the same CUDA PyTorch build as ComfyUI and its own
+MOSS dependencies. Each MOSS run receives a unique directory with the
+resolved configuration, command, dataset hashes, package list and separate
+model/preprocessing source snapshots in `moss-runtime.json`.
+
+Trainer documentation:
+https://github.com/kohya-ss/sd-scripts/blob/cb70b96858477e716a2096292ab8aab433277f38/docs/moss_image_train_network.md
+
