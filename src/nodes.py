@@ -277,12 +277,16 @@ def _resolve_clip_slot(name: str, value: Any) -> ResolvedSlot:
         return ResolvedSlot(name=name, replacement=str(exported_path), fingerprint=digest)
 
 
-def _resolve_vae_slot(name: str, value: Any) -> ResolvedSlot:
-    digest, exported_path = _export_state_dict_artifact(value.get_sd(), ".safetensors")
+def _resolve_vae_slot(name: str, value: Any, *, moss: bool = False) -> ResolvedSlot:
+    state_dict = value.get_sd()
+    if moss:
+        from .moss_runtime import training_vae_state_dict
+        state_dict = training_vae_state_dict(state_dict)
+    digest, exported_path = _export_state_dict_artifact(state_dict, ".safetensors")
     return ResolvedSlot(name=name, replacement=str(exported_path), fingerprint=digest)
 
 
-def _resolve_slot(slot: SlotSpec, raw_value: Any) -> ResolvedSlot:
+def _resolve_slot(slot: SlotSpec, raw_value: Any, *, moss: bool = False) -> ResolvedSlot:
     if slot.slot_type == "STRING":
         return _resolve_string_slot(slot.name, raw_value)
     if slot.slot_type == "MODEL":
@@ -290,7 +294,7 @@ def _resolve_slot(slot: SlotSpec, raw_value: Any) -> ResolvedSlot:
     if slot.slot_type == "CLIP":
         return _resolve_clip_slot(slot.name, raw_value)
     if slot.slot_type == "VAE":
-        return _resolve_vae_slot(slot.name, raw_value)
+        return _resolve_vae_slot(slot.name, raw_value, moss=moss)
     raise RuntimeError(f"Unsupported slot type: {slot.slot_type}")
 
 
@@ -779,7 +783,7 @@ def _execute_reference_lora(
             continue
         if slot.name not in slot_values:
             raise RuntimeError(f"Profile '{selected_profile.name}' requires input '{slot.name}'.")
-        resolved_slots[slot.name] = _resolve_slot(slot, slot_values[slot.name])
+        resolved_slots[slot.name] = _resolve_slot(slot, slot_values[slot.name], moss=moss)
     print(f"[md_soya] resolved_slots: {list(resolved_slots.keys())}")
 
     cache_key = _cache_key(

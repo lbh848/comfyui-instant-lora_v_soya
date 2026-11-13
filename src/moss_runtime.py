@@ -16,6 +16,20 @@ SD_SCRIPTS_COMMIT = "cb70b96858477e716a2096292ab8aab433277f38"
 SD_SCRIPTS_REPO = "https://github.com/kohya-ss/sd-scripts.git"
 
 
+def training_vae_state_dict(state_dict):
+    """Restore FLUX.2 names flattened by ComfyUI's AutoencoderKL loader."""
+    converted = {}
+    for key, value in state_dict.items():
+        if key.startswith("quant_conv."):
+            key = "encoder." + key
+        elif key.startswith("post_quant_conv."):
+            key = "decoder." + key
+        if key in converted:
+            raise ValueError(f"Duplicate FLUX.2 VAE weight after conversion: {key}")
+        converted[key] = value
+    return converted
+
+
 def prepare_training(profile, slots, builtins, run_dir, options, log_path, write_config):
     if options.train_text_encoder or not all((options.gradient_checkpointing,
                                               options.cache_latents, options.cache_text_encoder_outputs)):
@@ -64,7 +78,7 @@ def prepare_training(profile, slots, builtins, run_dir, options, log_path, write
         "model": [engine / profile.script, engine / "train_network.py", engine / "networks/lora_generic.py",
                   *sorted((engine / "library").glob("moss_image*.py")),
                   *sorted((engine / "library").glob("convrot_int8*.py"))],
-        "preprocessing": [Path(__file__).with_name("nodes.py"), engine / "library/strategy_moss_image.py",
+        "preprocessing": [Path(__file__), Path(__file__).with_name("nodes.py"), engine / "library/strategy_moss_image.py",
                           *sorted((engine / "library/dataset").rglob("*.py"))],
     }
     versions = {}
