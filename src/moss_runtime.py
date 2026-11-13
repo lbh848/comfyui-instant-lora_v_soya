@@ -84,6 +84,7 @@ def prepare_training(profile, slots, builtins, run_dir, options, log_path, write
                   *sorted((engine / "library").glob("convrot_int8*.py"))],
         "preprocessing": [Path(__file__), Path(__file__).with_name("nodes.py"), engine / "library/strategy_moss_image.py",
                           *sorted((engine / "library/dataset").rglob("*.py"))],
+        "training": [Path(__file__).parents[1] / "soya_lora_optimizers.py", engine / "library/optimizer.py"],
     }
     versions = {}
     for group, sources in groups.items():

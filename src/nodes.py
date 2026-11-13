@@ -124,6 +124,16 @@ class TrainOptions:
     seed_override: int = -1
     force_retrain: bool = False
     block_weight: str = ""
+    optimizer_type: str = "default"
+
+
+TRAINING_OPTIMIZERS = ("default", "AdamW", "AdamW8bit", "Muon")
+
+
+def _optimizer_type(value: str) -> str | None:
+    if value not in TRAINING_OPTIMIZERS:
+        raise ValueError(f"Unsupported training optimizer: {value}")
+    return "soya_lora_optimizers.Muon" if value == "Muon" else None if value == "default" else value
 
 
 def _plugin_root() -> Path:
@@ -185,6 +195,8 @@ def _tagging_options_from_input(value: Any | None) -> TaggingOptions:
 def _train_options_from_input(value: Any | None) -> TrainOptions:
     if not value:
         return TrainOptions()
+    optimizer_type = value.get("optimizer_type", "default")
+    _optimizer_type(optimizer_type)
     return TrainOptions(
         steps_override=int(value.get("steps_override", 0)),
         learning_rate_override=float(value.get("learning_rate_override", 0.0)),
@@ -199,6 +211,7 @@ def _train_options_from_input(value: Any | None) -> TrainOptions:
         seed_override=int(value.get("seed_override", -1)),
         force_retrain=bool(value.get("force_retrain", False)),
         block_weight=str(value.get("block_weight", "")),
+        optimizer_type=optimizer_type,
     )
 
 
@@ -523,6 +536,9 @@ def _gpu_supports_bf16() -> bool:
 
 def _apply_train_options(config_text: str, options: TrainOptions) -> str:
     overrides: dict[str, Any] = {}
+    optimizer_type = _optimizer_type(options.optimizer_type)
+    if optimizer_type is not None:
+        overrides["optimizer_type"] = optimizer_type
     if options.steps_override > 0:
         overrides["max_train_steps"] = options.steps_override
     if options.learning_rate_override > 0:
@@ -620,6 +636,10 @@ def _run_training(profile: ProfileDefinition, run_dir: Path, output_dir: Path, c
         training_cwd, training_env = paths.sd_scripts, None
     else:
         command, training_cwd, training_env = training_process
+
+    training_env = dict(training_env or {})
+    module_paths = [str(_plugin_root()), training_env.get("PYTHONPATH", os.environ.get("PYTHONPATH", ""))]
+    training_env["PYTHONPATH"] = os.pathsep.join(path for path in module_paths if path)
 
     pbar = comfy.utils.ProgressBar(total_steps) if total_steps and total_steps > 0 else None
     t_train_start = time.monotonic()
@@ -1365,7 +1385,8 @@ class TrainOptionsV1:
                     "multiline": False,
                     "tooltip": "LoRA Block Weight for SDXL. Format: comma-separated floats (e.g. '1,1,1,1,1,1,1,1,1,1,0,1,1,1,1,1,1,1,1,1,1'). Empty = all blocks enabled (default behavior). Only applies to SDXL profile."
                 }),
-            }
+            },
+            "optional": {"optimizer_type": (list(TRAINING_OPTIMIZERS), {"default": "default"})},
         }
 
     def build(self, **kwargs):
@@ -1391,6 +1412,7 @@ class AnimaTrainOptionsV2(TrainOptionsV1):
         })
         inputs["optional"] = {
             "preview_spectrum": ("BOOLEAN", {"default": True, "tooltip": "학습 프리뷰에 Spectrum을 적용합니다."}),
+            **inputs.get("optional", {}),
         }
         return inputs
 

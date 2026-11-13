@@ -22,7 +22,7 @@ def prepare_training(profile, slots, builtins, run_dir, options, v2_options, log
     # Reuse the caller's dataset, resolved model paths and output directory.
     # The upstream trainer consumes a dataset blueprint instead of sd-scripts'
     # repeat-folder config, so it needs its own config at this boundary.
-    from .nodes import _format_toml_value
+    from .nodes import _format_toml_value, _optimizer_type
 
     runpy.run_path(str(plugin_root() / "install.py"), run_name="__main__")
     engine = Path(v2_options.get("engine_path") or plugin_root() / "runtime" / "anima_lora").resolve()
@@ -63,7 +63,7 @@ def prepare_training(profile, slots, builtins, run_dir, options, v2_options, log
         "network_dim": options.network_dim_override or defaults["network_dim"],
         "network_alpha": options.network_alpha_override or defaults["network_alpha"],
         "seed": options.seed_override if options.seed_override >= 0 else defaults["seed"],
-        "optimizer_type": "AdamW",
+        "optimizer_type": _optimizer_type(options.optimizer_type) or defaults.get("optimizer_type", "AdamW"),
         "lr_scheduler": "constant",
         "mixed_precision": "bf16",
         "save_precision": "bf16",
