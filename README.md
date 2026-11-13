@@ -115,9 +115,20 @@ ConvRot INT8 model, `qwen3.5_9b_int8_convrot.safetensors` with CLIP type
 
 For 16GB GPUs keep batch 1, rank/alpha 16, gradient checkpointing, cached
 latents and cached text outputs enabled, and text encoder training disabled.
-The frozen base uses INT8 while the adapter is saved in BF16. The upstream
-memory table reports approximately 9.1GB at 1024 resolution and rank 16;
-actual usage depends on the input captions and buckets.
+The frozen base uses INT8 for both forward and backward
+(`convrot_int8_bwd = "int8"`), while the adapter is saved in BF16. The backward
+quantizes gradients, so it is not numerically identical to BF16 backward.
+Per-block Inductor compilation is enabled; the first step for a new bucket
+can take longer to compile. Static bucket shapes avoid requiring the Visual
+Studio C++ compiler for dynamic shapes on Windows. Compilation caches persist
+under `runtime/moss/compile_cache` and `runtime/moss/triton_cache`.
+Memory use and speed depend on the input captions, buckets and GPU.
+
+This profile uses sd-scripts' kernels and gradient checkpointing. It does not
+reproduce anima_lora's separate INT8 streaming, FlashAttention and activation
+budget implementation, so its RTX 5070 Ti benchmark is not a speed guarantee
+for this profile. Custom profiles can set `convrot_int8_bwd = "bf16"` and
+`compile = false` to use the previous execution path.
 
 The runtime installs the same CUDA PyTorch build as ComfyUI and its own
 MOSS dependencies. Each MOSS run receives a unique directory with the

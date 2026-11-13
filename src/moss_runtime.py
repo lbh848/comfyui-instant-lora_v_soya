@@ -55,6 +55,9 @@ def prepare_training(profile, slots, builtins, run_dir, options, log_path, write
     cuda_index = "https://download.pytorch.org/whl/cu" + torch.version.cuda.replace(".", "")
     runtime_identity = SD_SCRIPTS_COMMIT + ":" + torch.__version__ + ":" + hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
     env = {**os.environ, "PYTHONPATH": str(engine), "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8", "PYTHONUNBUFFERED": "1"}
+    # Keep compilation artifacts across runs, separate from the ANIMA backend.
+    env["TORCHINDUCTOR_CACHE_DIR"] = str(ensure_dir(root / "compile_cache"))
+    env["TRITON_CACHE_DIR"] = str(ensure_dir(root / "triton_cache"))
     marker = root / "venv" / ".moss_ready"
     if not marker.is_file() or marker.read_text(encoding="utf-8") != runtime_identity:
         run_command([uv, "pip", "install", "--python", str(python), "--index-url", cuda_index,
@@ -76,6 +79,7 @@ def prepare_training(profile, slots, builtins, run_dir, options, log_path, write
     # normal node manifest and output sidecars continue to own run settings/artifacts.
     groups = {
         "model": [engine / profile.script, engine / "train_network.py", engine / "networks/lora_generic.py",
+                  engine / "library/compile_utils.py",
                   *sorted((engine / "library").glob("moss_image*.py")),
                   *sorted((engine / "library").glob("convrot_int8*.py"))],
         "preprocessing": [Path(__file__), Path(__file__).with_name("nodes.py"), engine / "library/strategy_moss_image.py",
