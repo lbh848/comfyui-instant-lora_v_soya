@@ -33,7 +33,7 @@ if __name__ == "__main__":
     requirements = root / "requirements.txt"
     sources = (
         ("anima_lora", "https://github.com/sorryhyun/anima_lora.git",
-         "c52491c6c5664e5a6aa9f0defafd6255a0410548", "train.py"),
+         "2cebc9c3ba21a8cf5265a2d4ccf3e0316b1dcec2", "train.py"),
         ("anime_tools", "https://github.com/sorryhyun/anime_tools.git",
          "f5e0c69fd1d7554cef566ea5aafc9b0ee18bdf67", "anime_tools/__init__.py"),
     )

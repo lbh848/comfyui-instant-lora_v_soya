@@ -47,6 +47,7 @@ MAX_TRAIN_STEPS_PATTERN = re.compile(r"^\s*max_train_steps\s*=\s*(\d+)\s*$", re.
 MIXED_PRECISION_PATTERN = re.compile(r'^\s*mixed_precision\s*=\s*"([^"]+)"\s*$', re.MULTILINE)
 _TRAIN_STEP_RE = re.compile(r'\|\s*(\d+)/(\d+)\s')
 _TRAIN_LOSS_RE = re.compile(r'avr_loss[=:]\s*([0-9]*\.?[0-9]+)')
+_MOSS_V2_PROGRESS_RE = re.compile(r'^\s*progress (\d+)/(\d+) epoch \d+/\d+ loss (\S+)')
 
 
 def _notify_phase(text: str) -> None:
@@ -618,7 +619,7 @@ def _write_resolved_config(
     return config_path
 
 
-def _run_training(profile: ProfileDefinition, run_dir: Path, output_dir: Path, config_path: Path, log_path: Path, total_steps: int | None = None, training_process=None) -> tuple[Path, dict[int, float]]:
+def _run_training(profile: ProfileDefinition, run_dir: Path, output_dir: Path, config_path: Path, log_path: Path, total_steps: int | None = None, training_process=None, *, moss_v2: bool = False) -> tuple[Path, dict[int, float]]:
     paths = get_runtime_paths()
     if training_process is None:
         ensure_sd_scripts_environment(paths, log_path=log_path)
@@ -653,11 +654,13 @@ def _run_training(profile: ProfileDefinition, run_dir: Path, output_dir: Path, c
             if step > 0:
                 loss_history[step] = float(loss_match.group(1))
         if pbar is not None:
-            match = _TRAIN_STEP_RE.search(text)
+            match = _MOSS_V2_PROGRESS_RE.search(text) if moss_v2 else _TRAIN_STEP_RE.search(text)
             if match:
                 current = int(match.group(1))
                 total = int(match.group(2))
                 current_step[0] = current
+                if moss_v2:
+                    loss_history[current] = float(match.group(3))
                 pbar.update_absolute(current, total)
                 _notify_phase(f"Training step {current}/{total}")
                 # 구조화된 진행률 WebSocket 전송
@@ -678,7 +681,13 @@ def _run_training(profile: ProfileDefinition, run_dir: Path, output_dir: Path, c
                 _send_ws_progress("training", **ws_data)
 
     run_command(command, cwd=training_cwd, log_path=log_path, env=training_env, line_callback=on_line)
-    if training_process is not None:
+    if moss_v2:
+        # The final file contains EMA. Keep the native raw weights below the run folder.
+        for checkpoint in output_dir.glob("*/*_s*.safetensors"):
+            match = re.fullmatch(r"(.+)_s(\d+)\.safetensors", checkpoint.name)
+            if match:
+                checkpoint.rename(output_dir / f"{match[1]}-step{int(match[2]):08d}.safetensors")
+    elif training_process is not None:
         # The Anima engine saves step checkpoints below output_name/. The
         # existing retention, preview and sidecar pipeline expects them here.
         for checkpoint in output_dir.rglob("*.safetensors"):
@@ -712,7 +721,7 @@ def _execute_reference_lora(
     preview_positive_prompt="", preview_negative_prompt="",
     preview_no_lora=False,
     preview_model=None, preview_clip=None, preview_vae=None,
-    anima_v2=False,
+    anima_v2=False, moss_v2=False,
 ) -> tuple:
     print("[md_soya] _execute_reference_lora called")
     preview_spectrum = anima_v2 and (train_options or {}).get("preview_spectrum", True)
@@ -756,6 +765,8 @@ def _execute_reference_lora(
         raise RuntimeError(f"Profile '{profile_key}' not found. Available: {list(all_profiles.keys())}")
     selected_profile = all_profiles[profile_key]
     moss = selected_profile.script == "moss_image_train_network.py"
+    if moss_v2 and (not moss or vae is None):
+        raise ValueError("MOSS V2 requires the moss profile and a FLUX.2 VAE.")
     print(f"[md_soya] selected profile: {selected_profile.name} (key={selected_profile.key})")
     resolved_tagging = _tagging_options_from_input(tagging_options)
     resolved_train = _train_options_from_input(train_options)
@@ -815,7 +826,9 @@ def _execute_reference_lora(
         tagging_options=resolved_tagging,
         train_options=resolved_train,
     )
-    if anima_v2:
+    if moss_v2:
+        cache_key = f"moss_v2_{cache_key}_{secrets.token_hex(4)}"
+    elif anima_v2:
         cache_key = f"anima_v2_{cache_key}_{secrets.token_hex(4)}"
     elif moss:
         cache_key = f"moss_{cache_key}_{secrets.token_hex(4)}"
@@ -838,7 +851,14 @@ def _execute_reference_lora(
     _send_ws_progress("preparing", message=f"Training ({target_steps} steps)...")
     builtins = _builtins_for_run(dataset_dir, output_dir, output_name)
     training_process = None
-    if anima_v2:
+    if moss_v2:
+        from .moss_v2 import prepare_training
+        comfy.model_management.unload_all_models()
+        comfy.model_management.soft_empty_cache()
+        config_path, training_process, target_steps = prepare_training(
+            checkpoint_path, clip, vae, builtins, run_dir, resolved_train, train_options or {}, run_log,
+        )
+    elif anima_v2:
         from .anima_v2 import prepare_training
         comfy.model_management.unload_all_models()
         comfy.model_management.soft_empty_cache()
@@ -883,15 +903,16 @@ def _execute_reference_lora(
         preview_positive_prompt.strip() == "instance"
         and preview_negative_prompt.strip() == "instance"
     )
+    save_key = "save_every_steps" if moss_v2 else "save_every_n_steps"
     if _use_instance_image:
         config_text = config_path.read_text(encoding="utf-8")
-        config_text = re.sub(r"(?m)^save_every_n_steps\s*=.*\n?", "", config_text)
+        config_text = re.sub(rf"(?m)^{save_key}\s*=.*\n?", "", config_text)
         config_path.write_text(config_text, encoding="utf-8")
         print(f"[md_soya] instance mode: skipping intermediate saves, final checkpoint only")
     elif preview_enable and resolved_train.save_every_n_steps <= 0:
         auto_save_every = max(1, target_steps // 4)
         config_text = config_path.read_text(encoding="utf-8")
-        config_text = _set_toml_key(config_text, "save_every_n_steps", auto_save_every)
+        config_text = _set_toml_key(config_text, save_key, auto_save_every)
         config_path.write_text(config_text, encoding="utf-8")
         print(f"[md_soya] preview enabled, auto save_every_n_steps={auto_save_every}")
 
@@ -900,7 +921,7 @@ def _execute_reference_lora(
     if callable(soft_empty_cache):
         soft_empty_cache()
     print("[md_soya] calling _run_training...")
-    trained_lora, loss_history = _run_training(selected_profile, run_dir, output_dir, config_path, log_path=run_log, total_steps=target_steps, training_process=training_process)
+    trained_lora, loss_history = _run_training(selected_profile, run_dir, output_dir, config_path, log_path=run_log, total_steps=target_steps, training_process=training_process, moss_v2=moss_v2)
     print(f"[md_soya] training done, lora={trained_lora}, loss_history={len(loss_history)} entries")
     _notify_phase("Training complete!")
     _send_ws_progress("training_complete", message="Training complete!", lora_path=str(trained_lora))
@@ -1287,7 +1308,7 @@ class InstantReferenceLoRAV1:
             },
         }
 
-    def run(self, model, clip, model_strength, clip_strength, profile, context, vae=None, save_path="", tagging_options=None, train_options=None, preview_enable=False, preview_prompt_index=0, preview_seed=42, preview_steps=20, preview_cfg=7.0, preview_sampler="euler", preview_scheduler="normal", preview_width=512, preview_height=512, preview_positive_prompt="", preview_negative_prompt="", preview_no_lora=False, preview_model=None, preview_clip=None, preview_vae=None, anima_v2=False):
+    def run(self, model, clip, model_strength, clip_strength, profile, context, vae=None, save_path="", tagging_options=None, train_options=None, preview_enable=False, preview_prompt_index=0, preview_seed=42, preview_steps=20, preview_cfg=7.0, preview_sampler="euler", preview_scheduler="normal", preview_width=512, preview_height=512, preview_positive_prompt="", preview_negative_prompt="", preview_no_lora=False, preview_model=None, preview_clip=None, preview_vae=None, anima_v2=False, moss_v2=False):
         print(f"[md_soya] === Instant Reference LoRA started ===")
         print(f"[md_soya] profile={profile}, context={'provided' if context else 'None'}, vae={'provided' if vae else 'None'}")
         print(f"[md_soya] model_strength={model_strength}, clip_strength={clip_strength}, save_path={save_path}")
@@ -1320,6 +1341,7 @@ class InstantReferenceLoRAV1:
                 preview_clip=preview_clip,
                 preview_vae=preview_vae,
                 anima_v2=anima_v2,
+                moss_v2=moss_v2,
             )
             print(f"[md_soya] === completed ===\n{info}")
             if preview_batch is None:
@@ -1333,6 +1355,11 @@ class InstantReferenceLoRAV1:
 class AnimaReferenceLoRAV2(InstantReferenceLoRAV1):
     def run(self, *args, **kwargs):
         return super().run(*args, **kwargs, anima_v2=True)
+
+
+class MossReferenceLoRAV2(InstantReferenceLoRAV1):
+    def run(self, *args, **kwargs):
+        return super().run(*args, **kwargs, moss_v2=True)
 
 
 class TaggingOptionsV1:
@@ -1394,6 +1421,19 @@ class TrainOptionsV1:
 
     def build(self, **kwargs):
         return (kwargs,)
+
+
+class MossTrainOptionsV2(TrainOptionsV1):
+    @classmethod
+    def INPUT_TYPES(cls):
+        inputs = super().INPUT_TYPES()
+        inputs["optional"].update({
+            "max_train_epochs": ("INT", {"default": 0, "min": 0, "max": 100000}),
+            "warmup_ratio": ("FLOAT", {"default": 0.05, "min": 0.0, "max": 1.0, "step": 0.01}),
+            "ema_window": ("FLOAT", {"default": 0.1, "min": 0.0, "max": 1.0, "step": 0.01}),
+            "stream": (["fp32", "bf16"], {"default": "fp32"}),
+        })
+        return inputs
 
 
 class AnimaTrainOptionsV2(TrainOptionsV1):
@@ -1584,6 +1624,8 @@ class ContextBuilderPathOnlyV1:
 
 NODE_CLASS_MAPPINGS = {
     "md_soya_AnimaReferenceLoRAV2": AnimaReferenceLoRAV2,
+    "md_soya_MossReferenceLoRAV2": MossReferenceLoRAV2,
+    "md_soya_MossTrainOptionsV2": MossTrainOptionsV2,
     "md_soya_AnimaTrainOptionsV2": AnimaTrainOptionsV2,
     "md_soya_InstantReferenceLoRA": InstantReferenceLoRAV1,
     "md_soya_ContextBuilder": ContextBuilderV1,
@@ -1594,6 +1636,8 @@ NODE_CLASS_MAPPINGS = {
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "md_soya_AnimaReferenceLoRAV2": "md_soya Anima LoRA V2",
+    "md_soya_MossReferenceLoRAV2": "md_soya MOSS LoRA V2",
+    "md_soya_MossTrainOptionsV2": "md_soya MOSS Train Options V2",
     "md_soya_AnimaTrainOptionsV2": "md_soya Anima Train Options V2",
     "md_soya_InstantReferenceLoRA": "md_soya Instant Reference LoRA",
     "md_soya_ContextBuilder": "md_soya Context Builder",
