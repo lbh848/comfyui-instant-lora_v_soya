@@ -114,7 +114,8 @@ def prepare_training(checkpoint, clip, vae, builtins, run_dir, options, settings
     }
     config_path = run_dir / "train.toml"
     config_path.write_text("".join(f"{k} = {_format_toml_value(v)}\n" for k, v in config.items()), encoding="utf-8")
-    command = [sys.executable, "scripts/moss/train.py", "--config", str(config_path)]
+    trainer = Path(__file__).with_name("moss_v2_training.py")
+    command = [sys.executable, str(trainer), "--config", str(config_path)]
     # Keep the trainer's progress stream alongside the existing per-run log.
     env["ANIMA_DAEMON_JOB_DIR"] = str(run_dir)
     write_json(run_dir / "moss-runtime.json", {
@@ -122,6 +123,7 @@ def prepare_training(checkpoint, clip, vae, builtins, run_dir, options, settings
         "model": {str(p.relative_to(engine)): hashlib.sha256(p.read_bytes()).hexdigest()
                   for p in (engine / "library/moss/model.py", engine / "library/moss/loader.py",
                             engine / "library/moss/dit_int8/base.py")},
+        "training_adapter_sha256": hashlib.sha256(trainer.read_bytes()).hexdigest(),
         "preprocessing": {p.name: hashlib.sha256(p.read_bytes()).hexdigest()
                           for p in (Path(__file__), engine / "library/moss/caching/images.py")},
         "checkpoint_adapter_sha256": hashlib.sha256(Path(__file__).with_name("moss_v2_checkpoint.py").read_bytes()).hexdigest(),
