@@ -16,15 +16,26 @@ from filelock import FileLock
 from packaging.requirements import Requirement
 
 
+def source_ready(destination: Path, revision: str, entry: str) -> bool:
+    if not (destination / entry).is_file():
+        return False
+    completed = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=destination,
+        text=True, capture_output=True, timeout=30,
+        creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+    )
+    return completed.returncode == 0 and completed.stdout.strip() == revision
+
+
 if __name__ == "__main__":
     root = Path(__file__).resolve().parent
     runtime = root / "runtime"
     requirements = root / "requirements.txt"
     sources = (
         ("anima_lora", "https://github.com/sorryhyun/anima_lora.git",
-         "eca845a5e059208509b4f9a922a7c2ad249b10bf", "train.py"),
+         "c52491c6c5664e5a6aa9f0defafd6255a0410548", "train.py"),
         ("anime_tools", "https://github.com/sorryhyun/anime_tools.git",
-         "1fac04b4eb4b503bdac9ebd7a6ad6b5261e6f4da", "anime_tools/__init__.py"),
+         "f5e0c69fd1d7554cef566ea5aafc9b0ee18bdf67", "anime_tools/__init__.py"),
     )
     if sys.version_info < (3, 12):
         print("[Anima V2] Python 3.12 이상이 필요하여 V2 준비를 생략합니다. V1은 계속 사용할 수 있습니다.")
@@ -56,9 +67,11 @@ if __name__ == "__main__":
                     + importlib.metadata.version("torch").encode("utf-8")
                 ).hexdigest()
                 marker = runtime / ".anima_v2_ready"
+                source_readiness = {name: source_ready(runtime / name, revision, entry)
+                                    for name, _, revision, entry in sources}
                 ready = (
                     not missing
-                    and all((runtime / name / entry).is_file() for name, _, _, entry in sources)
+                    and all(source_readiness.values())
                     and marker.is_file()
                     and marker.read_text(encoding="utf-8").strip() == signature
                 )
@@ -82,7 +95,7 @@ if __name__ == "__main__":
 
                     for name, repository, revision, entry in sources:
                         destination = runtime / name
-                        if (destination / entry).is_file():
+                        if source_readiness[name]:
                             print(f"[Anima V2] 기존 엔진 재사용: {name}", flush=True)
                             continue
                         print(f"[Anima V2] 엔진 다운로드: {name}", flush=True)
@@ -100,11 +113,13 @@ if __name__ == "__main__":
                                     timeout=600, creationflags=creationflags,
                                 )
                             if destination.exists():
+                                if not destination.resolve().is_relative_to(runtime.resolve()):
+                                    raise RuntimeError(f"Backend path is outside the runtime directory: {destination}")
                                 backup_root = runtime / "backups"
                                 backup_root.mkdir(exist_ok=True)
                                 backup = Path(tempfile.mkdtemp(prefix=f"{name}-", dir=backup_root)) / name
                                 shutil.move(str(destination), str(backup))
-                                print(f"[Anima V2] 불완전한 기존 엔진 백업: {backup}", flush=True)
+                                print(f"[Anima V2] 기존 엔진 백업: {backup}", flush=True)
                             staging.replace(destination)
 
                     engine = runtime / "anima_lora"

@@ -90,14 +90,13 @@ The application's Install and Update buttons install this node's requirements.
 During the following ComfyUI startup, the node automatically downloads these
 source checkouts into its own `runtime/` and checks the training/cache commands:
 
-- `anima_lora`: commit `eca845a5e059208509b4f9a922a7c2ad249b10bf`.
-- `anime_tools`: tag `v0.9.3`, commit `1fac04b4eb4b503bdac9ebd7a6ad6b5261e6f4da`.
+- `anima_lora`: commit `c52491c6c5664e5a6aa9f0defafd6255a0410548`.
+- `anime_tools`: tag `v0.9.4`, commit `f5e0c69fd1d7554cef566ea5aafc9b0ee18bdf67`.
 
 The subprocess imports those sources directly. Upstream package metadata requires
-Python 3.13, but the ANIMA training path was smoke-tested locally with the existing
-ComfyUI Python 3.12.11, PyTorch 2.10.0+cu130 and triton-windows 3.6.0.post25. Both
-ordinary LoRA and T-LoRA completed three steps and saved checkpoints on an RTX 4080.
-This does not establish compatibility of the upstream GUI or other model families.
+Python 3.13; this node uses ComfyUI's Python 3.12 environment and checks the public
+training and embedding-cache commands during setup. The upstream GUI and other
+model families are separate from this runtime.
 
 No manual engine download, shell command or path setting is needed. Missing packages
 are also installed automatically when the node loads. A ready marker avoids downloads
@@ -106,6 +105,21 @@ next start. The automatic setup uses the existing ComfyUI Python environment and
 creates no additional virtual environment. It does not modify ComfyUI or host-project
 source/configuration. The existing V1 backend and workflows remain available.
 `engine_path` can still select an existing anima_lora checkout.
+
+The style V2 workflow carries the November 6 plain-LoRA recipe: rank 32,
+alpha 128, LR 5e-5, AdamW, 8 epochs, batch 1, gradient accumulation 2,
+constant LR with 5% warmup, per-micro-batch median clipping (k 2, window 50,
+sigma bands 0.2/0.4/0.6/0.8), weight-SVD initialization, caption dropout 0.1,
+adapter EMA 0.1, sigmoid sampling with bias 0 and flow shift 1, FP32 stream,
+and REPA/T-LoRA mask disabled. The additional settings are editable on
+`md_soya Anima Train Options V2`; omitted inputs preserve the previous
+character-workflow behavior. `max_train_epochs = 0` uses `steps_override`.
+A positive epoch count takes precedence and uses
+`epochs * ceil(image_count / gradient_accumulation_steps)` optimizer updates
+at batch 1. Warmup is a fraction of those updates. Saved checkpoints use the
+EMA weights when `ema_window > 0`. The resolved values remain in `train.toml`.
+The installer checks pinned engine revisions and preserves replaced checkouts
+under `runtime/backups/`.
 # MOSS Image INT8 training
 
 The `moss` profile uses sd-scripts v0.12.3 in `runtime/moss`, separately from

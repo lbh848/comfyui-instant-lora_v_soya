@@ -846,6 +846,9 @@ def _execute_reference_lora(
             selected_profile, resolved_slots, builtins, run_dir,
             resolved_train, train_options or {}, run_log,
         )
+        # Epoch workflows own the budget, including a partial accumulation window.
+        import tomllib
+        target_steps = tomllib.loads(config_path.read_text(encoding="utf-8"))["max_train_steps"]
     elif moss:
         from .moss_runtime import prepare_training
         comfy.model_management.unload_all_models()
@@ -1413,6 +1416,25 @@ class AnimaTrainOptionsV2(TrainOptionsV1):
         inputs["optional"] = {
             "preview_spectrum": ("BOOLEAN", {"default": True, "tooltip": "학습 프리뷰에 Spectrum을 적용합니다."}),
             **inputs.get("optional", {}),
+            "max_train_epochs": ("INT", {"default": 0, "min": 0, "max": 100000,
+                "tooltip": "0 uses steps_override. A positive value trains this many epochs instead of the step limit."}),
+            "gradient_accumulation_steps": ("INT", {"default": 1, "min": 1, "max": 1024}),
+            "lr_scheduler": (["constant", "constant_with_warmup", "cosine", "linear"], {"default": "constant"}),
+            "lr_warmup_steps": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01,
+                "tooltip": "Warmup fraction of optimizer steps. 0.05 means 5%."}),
+            "clip_mode": (["fixed", "median"], {"default": "fixed"}),
+            "max_grad_norm": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1000.0, "step": 0.1}),
+            "clip_k": ("FLOAT", {"default": 2.0, "min": 0.01, "max": 1000.0, "step": 0.1}),
+            "clip_window": ("INT", {"default": 50, "min": 10, "max": 100000}),
+            "clip_per_micro": ("BOOLEAN", {"default": False}),
+            "clip_sigma_bands": ("STRING", {"default": "", "tooltip": "Median clipping sigma band edges, for example 0.2,0.4,0.6,0.8. Empty uses one window."}),
+            "down_init": (["kaiming", "weight_svd"], {"default": "kaiming"}),
+            "caption_dropout_rate": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01}),
+            "ema_window": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01}),
+            "timestep_sampling": (["sigmoid", "uniform", "shift", "flux_shift", "sigma"], {"default": "sigmoid"}),
+            "sigmoid_bias": ("FLOAT", {"default": 0.0, "min": -10.0, "max": 10.0, "step": 0.1}),
+            "discrete_flow_shift": ("FLOAT", {"default": 1.0, "min": 0.01, "max": 100.0, "step": 0.1}),
+            "stream": (["bf16", "fp32"], {"default": "bf16"}),
         }
         return inputs
 

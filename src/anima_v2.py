@@ -48,6 +48,14 @@ def prepare_training(profile, slots, builtins, run_dir, options, v2_options, log
 
     model_paths = {slot.slot_type: slots[slot.name].replacement for slot in profile.slots}
     defaults = tomllib.loads(profile.config)
+    max_train_epochs = int(v2_options.get("max_train_epochs", 0))
+    gradient_accumulation_steps = int(v2_options.get("gradient_accumulation_steps", 1))
+    image_count = sum(1 for subset in subsets for path in subset.rglob("*")
+                      if path.suffix.lower() in IMAGE_EXTENSIONS)
+    if max_train_epochs < 0 or gradient_accumulation_steps < 1 or not image_count:
+        raise ValueError("Check the epoch count, gradient accumulation and training images.")
+    max_train_steps = (max_train_epochs * math.ceil(image_count / gradient_accumulation_steps)
+                       if max_train_epochs else options.steps_override or defaults["max_train_steps"])
     config = {
         "pretrained_model_name_or_path": model_paths["MODEL"],
         "qwen3": model_paths["CLIP"],
@@ -58,13 +66,26 @@ def prepare_training(profile, slots, builtins, run_dir, options, v2_options, log
         "progress_jsonl": "off",
         "network_module": "networks.lora_anima",
         "network_train_unet_only": True,
-        "max_train_steps": options.steps_override or defaults["max_train_steps"],
+        "max_train_steps": max_train_steps,
         "learning_rate": options.learning_rate_override or defaults["learning_rate"],
         "network_dim": options.network_dim_override or defaults["network_dim"],
         "network_alpha": options.network_alpha_override or defaults["network_alpha"],
         "seed": options.seed_override if options.seed_override >= 0 else defaults["seed"],
         "optimizer_type": _optimizer_type(options.optimizer_type) or defaults.get("optimizer_type", "AdamW"),
-        "lr_scheduler": "constant",
+        "lr_scheduler": v2_options.get("lr_scheduler", "constant"),
+        "lr_warmup_steps": float(v2_options.get("lr_warmup_steps", 0.0)),
+        "gradient_accumulation_steps": gradient_accumulation_steps,
+        "clip_mode": v2_options.get("clip_mode", "fixed"),
+        "max_grad_norm": v2_options.get("max_grad_norm", 1.0),
+        "clip_k": v2_options.get("clip_k", 2.0),
+        "clip_window": v2_options.get("clip_window", 50),
+        "clip_per_micro": v2_options.get("clip_per_micro", False),
+        "clip_sigma_bands": v2_options.get("clip_sigma_bands", ""),
+        "down_init": v2_options.get("down_init", "kaiming"),
+        "ema_window": v2_options.get("ema_window", 0.0),
+        "timestep_sampling": v2_options.get("timestep_sampling", "sigmoid"),
+        "sigmoid_bias": v2_options.get("sigmoid_bias", 0.0),
+        "discrete_flow_shift": v2_options.get("discrete_flow_shift", 1.0),
         "mixed_precision": "bf16",
         "save_precision": "bf16",
         "save_model_as": "safetensors",
@@ -84,14 +105,16 @@ def prepare_training(profile, slots, builtins, run_dir, options, v2_options, log
         "alpha_rank_scale": 1.0,
         "train_adaln": False,
         "channel_scaling_alpha": 0.0,
-        "stream": "bf16",
+        "stream": v2_options.get("stream", "bf16"),
         "vocab_pack": "",
         "use_repa": False,
         "use_cmmd": False,
-        "caption_dropout_rate": 0.0,
+        "caption_dropout_rate": v2_options.get("caption_dropout_rate", 0.0),
         "use_shuffled_caption_variants": False,
         "config_snapshot": True,
     }
+    if max_train_epochs:
+        config["max_train_epochs"] = max_train_epochs
     if options.save_every_n_steps > 0:
         config["save_every_n_steps"] = options.save_every_n_steps
     config_path = run_dir / "train.toml"
@@ -169,8 +192,9 @@ def prepare_training(profile, slots, builtins, run_dir, options, v2_options, log
     for command in commands:
         print(f"[Anima V2] preprocessing: {command}")
         run_command(command, cwd=engine, log_path=log_path, env=env)
-    command = [sys.executable, "train.py", "--config_file", str(config_path),
-               "--max_train_steps", str(config["max_train_steps"])]
+    command = [sys.executable, "train.py", "--config_file", str(config_path)]
+    if not max_train_epochs:
+        command.extend(["--max_train_steps", str(config["max_train_steps"])])
     (run_dir / "commands.json").write_text(
         json.dumps({"python": sys.executable, "cwd": str(engine), "resize": resized_images, "preprocess": commands,
                     "training": command}, ensure_ascii=False, indent=2), encoding="utf-8",
