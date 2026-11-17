@@ -34,8 +34,9 @@ if __name__ == "__main__":
     sources = (
         ("anima_lora", "https://github.com/sorryhyun/anima_lora.git",
          "2cebc9c3ba21a8cf5265a2d4ccf3e0316b1dcec2", "train.py"),
+        # v0.9.4 is an annotated tag. source_ready compares the checked-out commit.
         ("anime_tools", "https://github.com/sorryhyun/anime_tools.git",
-         "f5e0c69fd1d7554cef566ea5aafc9b0ee18bdf67", "anime_tools/__init__.py"),
+         "17e902c94576e68647b6c6b27d3b83a507510f1b", "anime_tools/__init__.py"),
     )
     if sys.version_info < (3, 12):
         print("[Anima V2] Python 3.12 이상이 필요하여 V2 준비를 생략합니다. V1은 계속 사용할 수 있습니다.")

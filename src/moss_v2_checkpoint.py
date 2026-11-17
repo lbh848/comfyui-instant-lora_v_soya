@@ -1,15 +1,12 @@
 """Adapt a Comfy ConvRot checkpoint to the pinned anima_lora MOSS loader."""
 from __future__ import annotations
 
-import hashlib
 import json
 from pathlib import Path
 import sys
-import tempfile
 from types import SimpleNamespace
 
 from comfy_kitchen.backends.eager.quantization import dequantize_int8_convrot_weight
-from filelock import FileLock
 from safetensors import safe_open
 from safetensors.torch import save_file
 import torch
@@ -74,20 +71,6 @@ def prepare_checkpoint(source: Path, destination: Path, digest: str, variant: st
     })
 
 
-def cached_checkpoint(source: Path, root: Path, variant: str) -> Path:
-    with source.open("rb") as stream:
-        digest = hashlib.file_digest(stream, "sha256").hexdigest()
-    root.mkdir(parents=True, exist_ok=True)
-    destination = root / digest
-    with FileLock(str(root / (digest + ".lock"))):
-        if not destination.is_dir():
-            with tempfile.TemporaryDirectory(dir=root) as stage:
-                candidate = Path(stage) / "model"
-                prepare_checkpoint(source, candidate, digest, variant)
-                candidate.rename(destination)
-    return destination
-
-
 if __name__ == "__main__":
-    source, root, result = map(Path, sys.argv[1:4])
-    result.write_text(str(cached_checkpoint(source, root, sys.argv[4])), encoding="utf-8")
+    source, destination = map(Path, sys.argv[1:3])
+    prepare_checkpoint(source, destination, sys.argv[3], sys.argv[4])

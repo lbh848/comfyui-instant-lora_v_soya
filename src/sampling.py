@@ -91,12 +91,17 @@ def patch_lora_onto_models(
     return new_model, new_clip
 
 
-def encode_conditioning(clip, text: str):
+def encode_conditioning(clip, text: str, cache: dict | None = None):
     """CLIP을 이용해 텍스트를 Conditioning으로 인코딩."""
     if clip is None:
         raise RuntimeError("CLIP is None for conditioning")
+    if cache is not None and text in cache:
+        return cache[text]
     tokens = clip.tokenize(text)
-    return clip.encode_from_tokens_scheduled(tokens)
+    conditioning = clip.encode_from_tokens_scheduled(tokens)
+    if cache is not None:
+        cache[text] = conditioning
+    return conditioning
 
 
 def generate_empty_latent(width: int, height: int, batch_size: int = 1):
@@ -141,14 +146,14 @@ def generate_preview(
     width: int, height: int,
     seed: int, steps: int, cfg: float,
     sampler_name: str, scheduler: str,
-    *, spectrum: bool = False,
+    *, spectrum: bool = False, conditioning_cache: dict | None = None,
 ):
     """
     전체 preview 파이프라인.
     반환: torch.Tensor [1, H, W, C] (RGB, float32, 0~1)
     """
-    positive = encode_conditioning(clip, positive_text)
-    negative = encode_conditioning(clip, negative_text)
+    positive = encode_conditioning(clip, positive_text, conditioning_cache)
+    negative = encode_conditioning(clip, negative_text, conditioning_cache)
     if spectrum:
         import nodes as comfy_nodes
 

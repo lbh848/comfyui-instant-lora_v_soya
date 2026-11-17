@@ -6,12 +6,34 @@ import os
 from pathlib import Path
 import runpy
 import sys
+import tempfile
 
 import comfy.model_management
+from filelock import FileLock
 import torch
 from safetensors.torch import save_file
 
 from .runtime import IMAGE_EXTENSIONS, ensure_dir, plugin_root, run_command, write_json
+
+
+def cached_checkpoint(source: Path, models: Path, variant: str, engine: Path, log_path: Path, env: dict) -> Path:
+    with source.open("rb") as stream:
+        digest = hashlib.file_digest(stream, "sha256").hexdigest()
+    destination = models / digest
+    with FileLock(str(models / (digest + ".lock"))):
+        if not destination.is_dir():
+            # Only the conversion subprocess needs exclusive VRAM. Cached inputs
+            # can use Comfy's usual memory management until the trainer starts.
+            comfy.model_management.unload_all_models()
+            comfy.model_management.soft_empty_cache()
+            with tempfile.TemporaryDirectory(dir=models) as stage:
+                candidate = Path(stage) / "model"
+                run_command([sys.executable, str(Path(__file__).with_name("moss_v2_checkpoint.py")),
+                             str(source), str(candidate), digest, variant], cwd=engine, log_path=log_path, env=env)
+                candidate.rename(destination)
+        else:
+            print(f"[MOSS V2] Reusing converted checkpoint {digest[:16]}", flush=True)
+    return destination
 
 
 @torch.inference_mode()
@@ -37,7 +59,6 @@ def cache_dataset(source: Path, cache: Path, clip, vae, resolution: int, engine:
         with image.open("rb") as stream:
             digest = hashlib.file_digest(stream, "sha256").hexdigest()
         dataset.append({"image": str(image), "sha256": digest, "caption": caption})
-    comfy.model_management.unload_all_models()
     for i, image in enumerate(files):
         with sizing["load_rgb"](image) as rgb:
             width, height = sizing["target_size"](*rgb.size, resolution)
@@ -67,11 +88,9 @@ def prepare_training(checkpoint, clip, vae, builtins, run_dir, options, settings
     visible = os.environ.get("CUDA_VISIBLE_DEVICES")
     device_index = device.index if device.index is not None else torch.cuda.current_device()
     env["CUDA_VISIBLE_DEVICES"] = visible.split(",")[device_index].strip() if visible else str(device_index)
-    model_result = run_dir / "model-dir.txt"
     variant = "base" if Path(checkpoint).name.casefold() == "moss_image_base_int8_convrot.safetensors" else "sft"
-    run_command([sys.executable, str(Path(__file__).with_name("moss_v2_checkpoint.py")), checkpoint,
-                 str(root / "runtime/moss_v2/models"), str(model_result), variant], cwd=engine, log_path=log_path, env=env)
-    model_dir = Path(model_result.read_text(encoding="utf-8"))
+    model_dir = cached_checkpoint(Path(checkpoint), ensure_dir(root / "runtime/moss_v2/models"),
+                                  variant, engine, log_path, env)
     cache = ensure_dir(run_dir / "embeddings")
     dataset = cache_dataset(Path(builtins["TRAIN_DIR"]), cache, clip, vae,
                             int(options.resolution_override or 1024), engine)
@@ -96,6 +115,8 @@ def prepare_training(checkpoint, clip, vae, builtins, run_dir, options, settings
     config_path = run_dir / "train.toml"
     config_path.write_text("".join(f"{k} = {_format_toml_value(v)}\n" for k, v in config.items()), encoding="utf-8")
     command = [sys.executable, "scripts/moss/train.py", "--config", str(config_path)]
+    # Keep the trainer's progress stream alongside the existing per-run log.
+    env["ANIMA_DAEMON_JOB_DIR"] = str(run_dir)
     write_json(run_dir / "moss-runtime.json", {
         "source_checkpoint": checkpoint, "source_sha256": model_dir.name, "dataset": dataset,
         "model": {str(p.relative_to(engine)): hashlib.sha256(p.read_bytes()).hexdigest()

@@ -853,8 +853,6 @@ def _execute_reference_lora(
     training_process = None
     if moss_v2:
         from .moss_v2 import prepare_training
-        comfy.model_management.unload_all_models()
-        comfy.model_management.soft_empty_cache()
         config_path, training_process, target_steps = prepare_training(
             checkpoint_path, clip, vae, builtins, run_dir, resolved_train, train_options or {}, run_log,
         )
@@ -940,6 +938,10 @@ def _execute_reference_lora(
     # --- Post-hoc preview: sample all checkpoints after training ---
     preview_images = []
     preview_map: dict[Path, list] = {}  # ckpt_path -> [(prompt_index, img_tensor), ...]
+    # Only reuse encodings from the same text encoder weights and settings.
+    conditioning_cache = {} if preview_enable and not _use_instance_image and pv_clip is not None and not (
+        pv_clip.patcher.forced_hooks or pv_clip.apply_hooks_to_conds
+    ) else None
     parsed_pos = _parse_prompt_groups(preview_positive_prompt) if preview_positive_prompt and not _use_instance_image else []
     parsed_neg = _parse_prompt_groups(preview_negative_prompt) if preview_negative_prompt and not _use_instance_image else []
 
@@ -969,14 +971,16 @@ def _execute_reference_lora(
                 for ckpt in checkpoints:
                     print(f"[md_soya] Sampling preview for {ckpt.name}...")
                     try:
-                        comfy.model_management.unload_all_models()
-                        if callable(soft_empty_cache):
-                            soft_empty_cache()
-
+                        # Comfy swaps the patches on the shared base model and
+                        # can retain its staged weights across checkpoints.
                         m_patched, c_patched = patch_lora_onto_models(
                             pv_model, pv_clip, str(ckpt), model_strength, clip_strength,
                             block_weight=resolved_train.block_weight,
                         )
+                        checkpoint_cache = None
+                        if conditioning_cache is not None and c_patched.patcher.clone_has_same_weights(pv_clip.patcher):
+                            c_patched = pv_clip
+                            checkpoint_cache = conditioning_cache
 
                         w = preview_width if preview_width > 0 else (context["images"].shape[2] if "images" in context else 512)
                         h = preview_height if preview_height > 0 else (context["images"].shape[1] if "images" in context else 512)
@@ -993,7 +997,7 @@ def _execute_reference_lora(
                                     preview_seed + len(preview_images),
                                     preview_steps, preview_cfg,
                                     preview_sampler, preview_scheduler,
-                                    spectrum=preview_spectrum,
+                                    spectrum=preview_spectrum, conditioning_cache=checkpoint_cache,
                                 )
                                 preview_images.append(img)
                                 preview_map[ckpt].append((pi + 1, img))
@@ -1020,7 +1024,7 @@ def _execute_reference_lora(
                                 preview_seed + len(preview_images),
                                 preview_steps, preview_cfg,
                                 preview_sampler, preview_scheduler,
-                                spectrum=preview_spectrum,
+                                spectrum=preview_spectrum, conditioning_cache=checkpoint_cache,
                             )
                             preview_images.append(img)
                             preview_map[ckpt].append((0, img))
@@ -1039,9 +1043,6 @@ def _execute_reference_lora(
                         print(f"[md_soya] Preview failed for {ckpt.name}: {exc}")
                         traceback.print_exc()
                         continue
-                    finally:
-                        del m_patched, c_patched
-                        comfy.model_management.unload_all_models()
         except Exception as exc:
             print(f"[md_soya] Post-hoc preview error: {exc}")
             traceback.print_exc()
@@ -1050,10 +1051,6 @@ def _execute_reference_lora(
     no_lora_images = []  # [(prompt_index, img_tensor), ...]
     if preview_no_lora and preview_enable and pv_vae is not None and not _use_instance_image:
         try:
-            comfy.model_management.unload_all_models()
-            if callable(soft_empty_cache):
-                soft_empty_cache()
-
             w = preview_width if preview_width > 0 else (context["images"].shape[2] if "images" in context else 512)
             h = preview_height if preview_height > 0 else (context["images"].shape[1] if "images" in context else 512)
 
@@ -1067,7 +1064,7 @@ def _execute_reference_lora(
                         preview_seed + len(preview_images),
                         preview_steps, preview_cfg,
                         preview_sampler, preview_scheduler,
-                        spectrum=preview_spectrum,
+                        spectrum=preview_spectrum, conditioning_cache=conditioning_cache,
                     )
                     no_lora_images.append((pi + 1, img))
                     preview_images.append(img)
@@ -1083,13 +1080,12 @@ def _execute_reference_lora(
                     preview_seed + len(preview_images),
                     preview_steps, preview_cfg,
                     preview_sampler, preview_scheduler,
-                    spectrum=preview_spectrum,
+                    spectrum=preview_spectrum, conditioning_cache=conditioning_cache,
                 )
                 no_lora_images.append((0, img))
                 preview_images.append(img)
                 print(f"[md_soya] No-LoRA preview done: {img.shape}")
 
-            comfy.model_management.unload_all_models()
         except Exception as exc:
             print(f"[md_soya] No-LoRA preview error: {exc}")
             traceback.print_exc()
