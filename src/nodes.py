@@ -1417,7 +1417,7 @@ class AnimaTrainOptionsV2(TrainOptionsV1):
             "preview_spectrum": ("BOOLEAN", {"default": True, "tooltip": "학습 프리뷰에 Spectrum을 적용합니다."}),
             **inputs.get("optional", {}),
             "max_train_epochs": ("INT", {"default": 0, "min": 0, "max": 100000,
-                "tooltip": "0 uses steps_override. A positive value trains this many epochs instead of the step limit."}),
+                "tooltip": "0 uses steps_override. The application supplies its preset's Epochs setting here."}),
             "gradient_accumulation_steps": ("INT", {"default": 1, "min": 1, "max": 1024}),
             "lr_scheduler": (["constant", "constant_with_warmup", "cosine", "linear"], {"default": "constant"}),
             "lr_warmup_steps": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01,

@@ -107,14 +107,15 @@ source/configuration. The existing V1 backend and workflows remain available.
 `engine_path` can still select an existing anima_lora checkout.
 
 The style V2 workflow carries the November 6 plain-LoRA recipe: rank 32,
-alpha 128, LR 5e-5, AdamW, 8 epochs, batch 1, gradient accumulation 2,
+alpha 128, LR 5e-5, AdamW, batch 1, gradient accumulation 2,
 constant LR with 5% warmup, per-micro-batch median clipping (k 2, window 50,
 sigma bands 0.2/0.4/0.6/0.8), weight-SVD initialization, caption dropout 0.1,
 adapter EMA 0.1, sigmoid sampling with bias 0 and flow shift 1, FP32 stream,
 and REPA/T-LoRA mask disabled. The additional settings are editable on
 `md_soya Anima Train Options V2`; omitted inputs preserve the previous
-character-workflow behavior. `max_train_epochs = 0` uses `steps_override`.
-A positive epoch count takes precedence and uses
+character-workflow behavior. The application preset selects the training basis
+and supplies `max_train_epochs` only in Epochs mode (8 by default for the style
+preset); STEP modes supply 0 and use `steps_override`. Epochs mode uses
 `epochs * ceil(image_count / gradient_accumulation_steps)` optimizer updates
 at batch 1. Warmup is a fraction of those updates. Saved checkpoints use the
 EMA weights when `ema_window > 0`. The resolved values remain in `train.toml`.
